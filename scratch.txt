@@ -1,1 +1,76 @@
-placeholder goes here
+id: PS-001
+title: Password Spray with Conditional Access Block
+description: Detects successful credential guesses during a password spray where access was denied by Conditional Access policies. Indicates valid credentials have been obtained, even though sign-in was blocked.
+severity: High
+status: production
+author: Detection Engineering Team
+date_created: 2025-09-02
+date_modified: 2025-09-02
+tags:
+  - tactic: Credential Access
+  - technique: T1110.003
+  - datasource: SigninLogs
+  - platform: AzureAD
+logic:
+  query: |
+    let SprayIPs = SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType != 0
+    | summarize FailedUsers = dcount(UserPrincipalName), Attempts = count() by IPAddress
+    | where FailedUsers > 5 and Attempts > 20;
+    
+    SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where ConditionalAccessStatus == "failure"
+    | join kind=inner (SprayIPs) on IPAddress
+    | project TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, Status, ConditionalAccessStatus, FailedUsers, Attempts
+  time_window: 1h
+  frequency: 5m
+  trigger: results > 0
+entities:
+  - UserAccount
+  - IPAddress
+fields_returned:
+  - TimeGenerated
+  - UserPrincipalName
+  - IPAddress
+  - AppDisplayName
+  - ConditionalAccessStatus
+references:
+  - https://attack.mitre.org/techniques/T1110/003/
+  - https://learn.microsoft.com/en-us/azure/active-directory/reports-monitoring/reference-sign-ins-error-codes
+triage:
+  - Confirm IP reputation (TOR, VPN, hosting providers).
+  - Check whether targeted accounts are privileged.
+  - Reset passwords or enforce MFA on impacted accounts.
+  - Hunt for other activity from the same IP across services.
+notes: |
+  This rule may fire when red teams or penetration testers run spray campaigns. Tune thresholds (FailedUsers, Attempts) to reduce false positives.
+
+
+
+/////
+
+
+(DLL sideload)
+DeviceImageLoadEvents
+| where Timestamp > ago(1h)
+| where InitiatingProcessFileName in~ ("OneDrive.exe", "Teams.exe", "svchost.exe", "rundll32.exe")
+// Filter to binaries commonly abused for sideloading
+| where not(FolderPath startswith "C:\\Program Files" or FolderPath startswith "C:\\Windows")
+// DLL loading from unexpected directory
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, FolderPath, SHA256, InitiatingProcessAccountName
+
+
+//////
+
+
+(PHP Webshell)
+DeviceFileEvents
+| where ActionType == "FileCreated"
+| where FileName endswith ".php"
+| where FolderPath has_any ("inetpub\\wwwroot", "htdocs", "/var/www/html")
+| where InitiatingProcessFileName in~ ("w3wp.exe", "httpd.exe", "nginx.exe", "php-cgi.exe")
+| where not(FolderPath has_any ("phpmyadmin", "upgrade", "install"))
+| extend WebshellIndicator = 1
