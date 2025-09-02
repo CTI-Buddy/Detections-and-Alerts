@@ -69,8 +69,65 @@ DeviceImageLoadEvents
 (PHP Webshell)
 DeviceFileEvents
 | where ActionType == "FileCreated"
-| where FileName endswith ".php"
+| where FileName matches regex @"(?i)\.(php|phtml|asp|aspx|jsp|jspx)$"
 | where FolderPath has_any ("inetpub\\wwwroot", "htdocs", "/var/www/html")
-| where InitiatingProcessFileName in~ ("w3wp.exe", "httpd.exe", "nginx.exe", "php-cgi.exe")
+| where InitiatingProcessFileName in~ ("w3wp.exe", "httpd.exe", "nginx.exe", "php-cgi.exe", "tomcat.exe", "java.exe")
 | where not(FolderPath has_any ("phpmyadmin", "upgrade", "install"))
 | extend WebshellIndicator = 1
+
+
+
+
+
+title: Webshell File Creation in Web Root
+id: f7a3c1d6-0b2b-4a72-8d85-09a93e5cba12
+status: experimental
+description: Detects creation of common webshell file types (.php, .phtml, .aspx, .jsp) in typical web server directories by web server processes.
+author: \m/
+date: 2025-09-02
+tags:
+  - attack.persistence
+  - attack.t1505.003 # Web Shell
+logsource:
+  product: windows
+  category: file_event
+detection:
+  selection:
+    ActionType: FileCreated
+    FileName|endswith:
+      - ".php"
+      - ".phtml"
+      - ".aspx"
+      - ".jsp"
+    FolderPath|contains_any:
+      - "inetpub\\wwwroot"
+      - "htdocs"
+      - "/var/www/html"
+    InitiatingProcessFileName|in:
+      - "w3wp.exe"
+      - "httpd.exe"
+      - "nginx.exe"
+      - "php-cgi.exe"
+  filter:
+    FolderPath|contains_any:
+      - "phpmyadmin"
+      - "upgrade"
+      - "install"
+  condition: selection and not filter
+logic:
+  query: |
+DeviceFileEvents
+| where ActionType == "FileCreated"
+| where FileName matches regex @"(?i)\.(php|phtml|asp|aspx|jsp|jspx)$"
+| where FolderPath has_any ("inetpub\\wwwroot", "htdocs", "/var/www/html")
+| where InitiatingProcessFileName in~ ("w3wp.exe", "httpd.exe", "nginx.exe", "php-cgi.exe", "tomcat.exe", "java.exe")
+| where not(FolderPath has_any ("phpmyadmin", "upgrade", "install"))
+| extend WebshellIndicator = 1
+fields:
+  - DeviceId
+  - FileName
+  - FolderPath
+  - InitiatingProcessFileName
+  - InitiatingProcessCommandLine
+level: high
+
