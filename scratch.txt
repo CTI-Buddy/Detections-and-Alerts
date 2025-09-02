@@ -131,3 +131,45 @@ fields:
   - InitiatingProcessCommandLine
 level: high
 
+
+
+///
+
+
+id: <unique-detection-id>
+title: <detection name>
+description: <short summary of what the detection finds>
+severity: <High | Medium | Low>
+status: <experimental | production | deprecated>
+author: <your name/team>
+date_created: <YYYY-MM-DD>
+date_modified: <YYYY-MM-DD>
+tags:
+  - tactic: <MITRE ATT&CK tactic>
+  - technique: <ATT&CK technique ID>
+  - datasource: <table(s) used>
+  - platform: <Windows | AzureAD | M365 | Linux>
+logic:
+  query: |
+    <KQL query here>
+  time_window: <e.g. 1h>
+  frequency: <how often query should run>
+  trigger: <e.g. number of results > 0>
+entities:
+  - UserAccount
+  - IPAddress
+  - Device
+fields_returned:
+  - Timestamp
+  - UserPrincipalName
+  - IPAddress
+  - AppDisplayName
+references:
+  - <URL to ATT&CK>
+  - <research/blog/advisory>
+triage:
+  - <what the SOC should check>
+  - <follow-up steps>
+notes: |
+  <any caveats, tuning guidance, or known FPs>
+
