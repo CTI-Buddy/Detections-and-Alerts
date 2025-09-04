@@ -280,4 +280,28 @@ mitre:
   technique: T1078
   tactic: credential-access
 
+///
 
+# MITRE ATT&CK Coverage Heatmap (Microsoft-focused)
+
+| Tactic / Subtechnique         | Status  |
+|-------------------------------|---------|
+| **Initial Access**            |         |
+| T1078.004 - Cloud Accounts    | ✅      |
+| T1133 - External Remote Svcs  | ⬜      |
+|                               |         |
+| **Persistence**               |         |
+| T1098.003 - Add OAuth Consent | 🚧      |
+| T1098 - Add Service Principal | ⬜      |
+|                               |         |
+| **Credential Access**         |         |
+| T1550 - Token Replay          | ⬜      |
+|                               |         |
+| **Collection**                |         |
+| T1114.003 - Mailbox Rule Add  | ✅      |
+|                               |         |
+| **Defense Evasion**           |         |
+| T1070.004 - File Deletion     | ⬜      |
+|                               |         |
+| **Command & Control**         |         |
+| T1071.001 - Web Protocols     | ⬜      |
