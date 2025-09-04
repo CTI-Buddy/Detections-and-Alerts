@@ -173,3 +173,111 @@ triage:
 notes: |
   <any caveats, tuning guidance, or known FPs>
 
+
+
+///////
+
+
+let timeframe = 14d;
+SigninLogs
+| where TimeGenerated > ago(timeframe)
+| where ResultType == "0"  // Successful sign-ins only
+| extend CompositeState = pack(
+    "UA", UserAgent,
+    "DeviceId", tostring(DeviceDetail.deviceId),
+    "AuthReq", AuthenticationRequirement,
+    "CAStatus", ConditionalAccessStatus,
+    "IP", IPAddress,
+    "Location", Location,
+    "Risk", RiskLevelDuringSignIn
+  )
+| partition hint.strategy=native by UserPrincipalName (
+    order by TimeGenerated asc
+    | scan declare (expected_states: dynamic = dynamic([])) with (
+        step s: true =>
+        expected_states = set_union(s.expected_states, pack_array(CompositeState))
+    )
+    | extend PreviousStates = expected_states[0:-1]
+    | extend CurrentState = tostring(CompositeState)
+    | extend RiskScore =
+        iif(UserAgent !in (PreviousStates.UA), 5, 0) +
+        iif(tostring(DeviceDetail.deviceId) !in (PreviousStates.DeviceId), 10, 0) +
+        iif(AuthenticationRequirement != PreviousStates.AuthReq, 10, 0) +
+        iif(ConditionalAccessStatus != PreviousStates.CAStatus, 5, 0) +
+        iif(RiskLevelDuringSignIn != "none", 10, 0) +
+        iif(Location != PreviousStates.Location, 1, 0)
+    | where RiskScore > 0
+)
+| project TimeGenerated, UserPrincipalName, CurrentState, RiskScore
+| order by RiskScore desc
+
+
+////
+
+title: Azure AD Sign-in State Change with Risk Scoring
+id: 7c1ef1c9-82ab-45e8-9c1b-5f3c2b24a871
+status: experimental
+description: |
+  Detects suspicious state changes in Azure AD sign-ins, such as new devices,
+  changes in authentication requirements, or Conditional Access enforcement shifts.
+  Each state change is assigned a weighted risk score. High scores indicate higher
+  likelihood of account compromise.
+author: Your Name
+date: 2025-09-02
+tags:
+  - attack.credential_access
+  - attack.t1078 # Valid Accounts
+  - azure
+  - o365
+logsource:
+  product: azure
+  service: signinlogs
+detection:
+  query: |
+    let timeframe = 14d;
+    SigninLogs
+    | where TimeGenerated > ago(timeframe)
+    | where ResultType == "0"  // Successful sign-ins only
+    | extend CompositeState = pack(
+        "UA", UserAgent,
+        "DeviceId", tostring(DeviceDetail.deviceId),
+        "AuthReq", AuthenticationRequirement,
+        "CAStatus", ConditionalAccessStatus,
+        "IP", IPAddress,
+        "Location", Location,
+        "Risk", RiskLevelDuringSignIn
+      )
+    | partition hint.strategy=native by UserPrincipalName (
+        order by TimeGenerated asc
+        | scan declare (expected_states: dynamic = dynamic([])) with (
+            step s: true =>
+            expected_states = set_union(s.expected_states, pack_array(CompositeState))
+        )
+        | extend PreviousStates = expected_states[0:-1]
+        | extend CurrentState = tostring(CompositeState)
+        | extend RiskScore =
+            iif(UserAgent !in (PreviousStates.UA), 5, 0) +
+            iif(tostring(DeviceDetail.deviceId) !in (PreviousStates.DeviceId), 10, 0) +
+            iif(AuthenticationRequirement != PreviousStates.AuthReq, 10, 0) +
+            iif(ConditionalAccessStatus != PreviousStates.CAStatus, 5, 0) +
+            iif(RiskLevelDuringSignIn != "none", 10, 0) +
+            iif(Location != PreviousStates.Location, 1, 0)
+        | where RiskScore > 0
+    )
+    | project TimeGenerated, UserPrincipalName, CurrentState, RiskScore
+    | order by RiskScore desc
+level: medium
+fields:
+  - TimeGenerated
+  - UserPrincipalName
+  - CurrentState
+  - RiskScore
+falsepositives:
+  - Legitimate user traveling internationally or switching VPN providers.
+  - User upgrading/replacing a device.
+  - New MFA policies being rolled out.
+mitre:
+  technique: T1078
+  tactic: credential-access
+
+
