@@ -1,17 +1,29 @@
-id: T1574.002-windows-dll-sideloading
-name: "DLL Sideloading Detection (Windows)"
-description: |
-  Detects potential DLL sideloading activity where high-value processes
-  (e.g., Teams, OneDrive, svchost, rundll32) load DLLs from unusual or
-  non-standard directories outside of core system or Program Files paths. 
-  This technique is commonly abused by adversaries to gain execution under
-  trusted processes and evade defenses.
-author: "YourName"
-date: 2025-09-02
-severity: High
-status: experimental
-tags:
-  - attack.persistence
-  - attack.defense_evasion
-  - attack.t1574.002
-platform: windows
+  - Confirm the webshell file path is outside normal application or upgrade directories.
+  - Review the initiating process (w3wp.exe, httpd.exe, nginx.exe, php-cgi.exe).
+  - Check if the file was uploaded recently via an external connection (IIS logs, access logs).
+  - Validate the file contents (suspicious obfuscation, `eval`, `system` calls).
+  - Isolate the host if the file is confirmed malicious.
+  - Investigate for lateral movement or credential dumping from the same server.
+  - Review external connections made after the file creation.
+
+
+
+
+  - Validate whether the DLL was loaded from an unusual path (AppData, temp, downloads).
+  - Review the parent process (Teams.exe, OneDrive.exe, svchost.exe, rundll32.exe).
+  - Check the file’s digital signature and hash reputation.
+  - If unsigned or untrusted, retrieve the file for analysis (static/dynamic).
+  - Investigate how the DLL arrived (installation, dropped by malware, user download).
+  - Hunt for persistence mechanisms tied to the same binary (services, scheduled tasks).
+  - Isolate the host if malicious DLL execution is confirmed.
+
+
+
+
+  - Review the sign-in details flagged with elevated `RiskScore` and confirm which factor(s) contributed (new device, new location, new user agent, CA bypass).
+  - Validate whether the change aligns with expected user behavior (e.g., legitimate travel, device reimage, new app rollout).
+  - Correlate with Azure AD Identity Protection risk detections for the same user to confirm if other anomalies are present.
+  - Check Conditional Access policies applied: Was access blocked, granted, or bypassed?
+  - Investigate whether the same IP or device attempted other logins across different accounts (possible password spray or shared compromised host).
+  - If activity appears malicious, require user re-authentication and reset credentials; enforce MFA if not already in place.
+  - For confirmed account compromise, hunt for additional suspicious activity (mailbox rules, token theft, persistence mechanisms).
