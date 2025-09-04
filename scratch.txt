@@ -305,3 +305,32 @@ mitre:
 |                               |         |
 | **Command & Control**         |         |
 | T1071.001 - Web Protocols     | ⬜      |
+
+
+////
+
+
+DeviceImageLoadEvents
+// Look back 24 hours in a detection rule to avoid missing events due to timing
+| where Timestamp > ago(24h)
+// High-value, commonly targeted processes
+| where InitiatingProcessFileName in~ ("OneDrive.exe", "Teams.exe", "svchost.exe", "rundll32.exe", "explorer.exe", "msiexec.exe")
+// CRITICAL: Filter for DLLs loaded from unexpected, non-standard paths
+| where not (
+    FolderPath startswith "C:\\Program Files" or
+    FolderPath startswith "C:\\Windows" or
+    FolderPath startswith "C:\\ProgramData" or // Add common legitimate paths
+    FolderPath contains "Microsoft\\Teams\\" or // Exclude Teams' own updater directories
+    FolderPath contains "OneDrive\\" // Exclude OneDrive's own directory
+)
+// Additional filter: Only look for DLLs, not other EXEs, to focus on classic sideloading
+| where FileName endswith ".dll"
+// Summarize to get one alert per malicious DLL per device, with all contexts
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    LoadedByProcesses = make_set(InitiatingProcessFileName),
+    LoadedFromPaths = make_set(FolderPath),
+    AssociatedAccounts = make_set(InitiatingProcessAccountName),
+    SHA256s = make_set(SHA256)
+    by DeviceName, FileName
