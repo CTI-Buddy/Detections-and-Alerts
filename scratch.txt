@@ -1,29 +1,91 @@
-  - Confirm the webshell file path is outside normal application or upgrade directories.
-  - Review the initiating process (w3wp.exe, httpd.exe, nginx.exe, php-cgi.exe).
-  - Check if the file was uploaded recently via an external connection (IIS logs, access logs).
-  - Validate the file contents (suspicious obfuscation, `eval`, `system` calls).
-  - Isolate the host if the file is confirmed malicious.
-  - Investigate for lateral movement or credential dumping from the same server.
-  - Review external connections made after the file creation.
+let Lookback = 24h;
+let Window = 30m;
+// Maintain your tenant domains here
+let OrgDomains = dynamic(["contoso.com","contoso.onmicrosoft.com"]);
+let SuspiciousRules =
+AuditLogs
+| where TimeGenerated > ago(Lookback)
+| where Operation in ("New-InboxRule","Set-InboxRule")
+| extend P = parse_json(tostring(Parameters))
+| extend RuleName      = tostring(P["Name"])
+| extend ForwardTo     = tostring(P["ForwardTo"])
+| extend RedirectTo    = tostring(P["RedirectTo"])
+| extend DeleteMessage = tobool(P["DeleteMessage"])
+| extend MoveToFolder  = tostring(P["MoveToFolder"])
+| extend ExternalForward = iff(isnotempty(ForwardTo)
+                               and not(tolower(ForwardTo) matches regex strcat(@"(?i)@(", strcat_array(OrgDomains, "|"), ")$")), 1, 0)
+| extend HasRedirect     = iff(isnotempty(RedirectTo)
+                               and not(tolower(RedirectTo) matches regex strcat(@"(?i)@(", strcat_array(OrgDomains, "|"), ")$")), 1, 0)
+| extend HasDelete   = iff(DeleteMessage == true, 1, 0)
+| extend HasMove     = iff(isnotempty(MoveToFolder), 1, 0)
+| where ExternalForward == 1 or HasRedirect == 1 or HasDelete == 1 or HasMove == 1
+| project TimeGenerated, UserId, ClientIP, RuleName, ForwardTo, RedirectTo, MoveToFolder,
+          ExternalForward, HasRedirect, HasDelete, HasMove;
+// Correlate distinct action types per user within a short window
+let Correlated =
+SuspiciousRules
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen  = max(TimeGenerated),
+    ActionTypes = make_set(
+        case(ExternalForward==1, "forward",
+             HasRedirect==1,     "redirect",
+             HasDelete==1,       "delete",
+             HasMove==1,         "move", "other")),
+    Destinations = make_set(coalesce(ForwardTo, RedirectTo)),
+    ClientIPs    = make_set(ClientIP),
+    RuleNames    = make_set(RuleName),
+    Events       = count()
+  by UserId, bin(TimeGenerated, Window)
+| extend HasForward = array_length(set_intersect(ActionTypes, dynamic(["forward","redirect"]))) > 0
+| extend HasDelete  = array_length(set_intersect(ActionTypes, dynamic(["delete"]))) > 0
+| extend HasMove    = array_length(set_intersect(ActionTypes, dynamic(["move"])))   > 0
+| extend CorrelatedHit = iff(HasForward and (HasDelete or HasMove), 1, 0)
+| where CorrelatedHit == 1;
+// Optional enrichment: risky/blocked sign-ins around the same window
+let RiskySigninByUserWindow =
+SigninLogs
+| where TimeGenerated > ago(Lookback)
+| where ResultType == "0"
+| project SigninTime=TimeGenerated, UserPrincipalName, IPAddress, RiskLevelDuringSignIn, ConditionalAccessStatus
+| summarize
+    SigninSamples = make_set(pack("t", SigninTime, "ip", IPAddress, "risk", RiskLevelDuringSignIn, "ca", ConditionalAccessStatus), 5),
+    AnyRisk = any(RiskLevelDuringSignIn != "none"),
+    AnyCABlock = any(ConditionalAccessStatus == "failure")
+  by UserPrincipalName, bin(SigninTime, Window);
+Correlated
+| join kind=leftouter (RiskySigninByUserWindow) on $left.UserId == $right.UserPrincipalName and $left.TimeGenerated == $right.SigninTime
+| extend RiskSignal = iif(AnyRisk or AnyCABlock, "elevated", "none")
+| project FirstSeen, LastSeen, UserId, ClientIPs, Destinations, RuleNames, ActionTypes, Events, RiskSignal, SigninSamples
+| order by FirstSeen desc
 
 
+///
 
-
-  - Validate whether the DLL was loaded from an unusual path (AppData, temp, downloads).
-  - Review the parent process (Teams.exe, OneDrive.exe, svchost.exe, rundll32.exe).
-  - Check the file’s digital signature and hash reputation.
-  - If unsigned or untrusted, retrieve the file for analysis (static/dynamic).
-  - Investigate how the DLL arrived (installation, dropped by malware, user download).
-  - Hunt for persistence mechanisms tied to the same binary (services, scheduled tasks).
-  - Isolate the host if malicious DLL execution is confirmed.
-
-
-
-
-  - Review the sign-in details flagged with elevated `RiskScore` and confirm which factor(s) contributed (new device, new location, new user agent, CA bypass).
-  - Validate whether the change aligns with expected user behavior (e.g., legitimate travel, device reimage, new app rollout).
-  - Correlate with Azure AD Identity Protection risk detections for the same user to confirm if other anomalies are present.
-  - Check Conditional Access policies applied: Was access blocked, granted, or bypassed?
-  - Investigate whether the same IP or device attempted other logins across different accounts (possible password spray or shared compromised host).
-  - If activity appears malicious, require user re-authentication and reset credentials; enforce MFA if not already in place.
-  - For confirmed account compromise, hunt for additional suspicious activity (mailbox rules, token theft, persistence mechanisms).
+title: Correlated Malicious Mailbox Rules (Forward + Delete/Move)
+id: m365-mailbox-rules-correlated
+description: |
+  Correlates multiple suspicious inbox rule actions by the same user within a short window.
+  Triggers when an external forward/redirect is created together with delete or move actions,
+  a strong indicator of account takeover and stealthy email tampering/exfiltration.
+tags:
+  - attack.persistence
+  - attack.collection
+  - attack.exfiltration
+  - attack.t1114.003
+logsource:
+  product: m365
+  service: Exchange/AuditLogs
+detection:
+  kql: |
+    <paste KQL above>
+level: high
+triage:
+  - Validate: Confirm the rule destinations are external and not approved domains; review `RuleNames`, `Destinations`, and `ActionTypes`.
+  - Scope: Check `SigninSamples` for risky or CA-blocked sign-ins near `FirstSeen`; pivot on `ClientIPs` across other users.
+  - Contain: Remove/suppress the rules, revoke sessions, reset password, and require re-registration of MFA.
+  - Investigate: Search for additional persistence (App passwords, OAuth grants, mailbox delegate changes) and data exfil (Graph API downloads).
+  - Remediate: Block offending IP ranges; review Conditional Access gaps that allowed the sign-in.
+falsepositives:
+  - Rare cases of approved external forwarding plus administrative cleanup rules; add allowlisted destinations/domains.
+status: production
