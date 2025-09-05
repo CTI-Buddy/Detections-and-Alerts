@@ -1,86 +1,21 @@
-let Minimum_Users = 10;
-// Step 1: Find suspicious apps
-let SuspiciousApps = OAuthAppInfo
-| where AppStatus == "Enabled"
-| where AppOrigin == "External"
-| where ConsentedUsersCount > 0 and ConsentedUsersCount < Minimum_Users
-| where IsAdminConsented == 0
-| mv-expand Permissions
-| extend HighRiskPermission = iif(Permissions has_any ("Mail.ReadWrite","Mail.ReadWrite.All","Files.ReadWrite.All","User.ReadWrite.All","offline_access"), 1, 0)
-| summarize Permissions = make_set(Permissions), HighRisk = max(HighRiskPermission) by AppId, AppDisplayName, ConsentedUsersCount
-| where HighRisk == 1;   // Step 2: only apps with sensitive perms
-
-// Step 3: Correlate with sign-ins to those apps
-SigninLogs
-| where AppId in (SuspiciousApps)
-| summarize Logins = count(), Users = make_set(UserPrincipalName), IPs = make_set(IPAddress) by AppId, AppDisplayName
-| join kind=inner SuspiciousApps on AppId
-| project
-    TimeWindow = ago(24h),
-    AppId,
-    AppDisplayName,
-    ConsentedUsersCount,
-    Permissions,
-    Users,
-    IPs,
-    Logins
-| order by Logins desc
-
-
-
-
-name: Suspicious External OAuth App with User Activity and Sensitive Permissions
-id: aad_suspicious_oauth_app_correlation
-description: |
-  Detects external OAuth applications that have been consented to by a small number of users, 
-  request sensitive permissions, and are subsequently used in sign-ins. This correlation aims 
-  to identify malicious apps leveraging OAuth abuse techniques for persistence and data access.
-author: detection-team
-severity: High
-status: Experimental
-tactics:
-  - Persistence
-  - Credential Access
-  - Collection
-techniques:
-  - T1136.003  # Create Account: Cloud Account
-  - T1528      # Steal Application Access Token
-  - T1550.001  # Use of Application Access Tokens
-  - T1098.005  # Account Manipulation: Additional Cloud Credentials
-query: |
-  let Minimum_Users = 10;
-  let SuspiciousApps = 
-      OAuthAppInfo
-      | where AppStatus == "Enabled"
-      | where AppOrigin == "External"
-      | where ConsentedUsersCount > 0 and ConsentedUsersCount < Minimum_Users
-      | where IsAdminConsented == 0
-      | mv-expand Permissions
-      | where tostring(Permissions) has_any ("Mail.Read", "Mail.Send", "Mail.ReadWrite", "Files.ReadWrite", "offline_access")
-      | project AppId, AppName, Permissions, ConsentedUsersCount, AddedDateTime;
-  let AppSignIns = 
-      SigninLogs
-      | where AppId in (SuspiciousApps)
-      | where ResultType == 0
-      | project AppId, UserPrincipalName, IPAddress, ResourceDisplayName, TimeGenerated;
-  SuspiciousApps
-  | join kind=inner (AppSignIns) on AppId
-  | project TimeGenerated, AppId, AppName, UserPrincipalName, IPAddress, ResourceDisplayName, Permissions, ConsentedUsersCount, AddedDateTime
-time_window: 1d
-frequency: 1h
-trigger: > 
-  0
-entities:
-  - AppId
-  - UserPrincipalName
-  - IPAddress
-fields_returned:
-  - TimeGenerated
-  - AppId
-  - AppName
-  - UserPrincipalName
-  - IPAddress
-  - ResourceDisplayName
-  - Permissions
-  - ConsentedUsersCount
-  - AddedDateTime
+Validate the app
+Check the AppDisplayName and AppId in the alert.
+Confirm whether the application is sanctioned by IT/security or if it’s unknown.
+Look up the publisher/registration details to confirm legitimacy.
+Review the permissions
+Identify which delegated or application permissions were requested.
+Flag immediately if sensitive scopes are present (Mail.ReadWrite, Files.ReadWrite.All, offline_access, etc.).
+Check user consent activity
+Identify the list of ConsentedUsers.
+Review whether these are high-value or privileged accounts (admins, executives, finance, IT).
+Investigate sign-ins linked to the app
+Query SigninLogs for activity associated with the suspicious AppId.
+Look for unusual IP addresses, geographies, or impossible travel.
+Correlate sign-ins with time of consent to detect attacker follow-up.
+Scope potential impact
+Review mailbox or file activity by the consenting accounts.
+Look for spikes in access, downloads, or forwarding rules.
+Contain & mitigate
+If malicious: disable the OAuth app (Set-AzureADServicePrincipal -AccountEnabled $false).
+Revoke tokens and reset passwords for impacted users.
+Consider conditional access or app consent policies to prevent recurrence
