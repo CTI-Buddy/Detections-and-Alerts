@@ -1,21 +1,529 @@
-Validate the app
-Check the AppDisplayName and AppId in the alert.
-Confirm whether the application is sanctioned by IT/security or if it’s unknown.
-Look up the publisher/registration details to confirm legitimacy.
-Review the permissions
-Identify which delegated or application permissions were requested.
-Flag immediately if sensitive scopes are present (Mail.ReadWrite, Files.ReadWrite.All, offline_access, etc.).
-Check user consent activity
-Identify the list of ConsentedUsers.
-Review whether these are high-value or privileged accounts (admins, executives, finance, IT).
-Investigate sign-ins linked to the app
-Query SigninLogs for activity associated with the suspicious AppId.
-Look for unusual IP addresses, geographies, or impossible travel.
-Correlate sign-ins with time of consent to detect attacker follow-up.
-Scope potential impact
-Review mailbox or file activity by the consenting accounts.
-Look for spikes in access, downloads, or forwarding rules.
-Contain & mitigate
-If malicious: disable the OAuth app (Set-AzureADServicePrincipal -AccountEnabled $false).
-Revoke tokens and reset passwords for impacted users.
-Consider conditional access or app consent policies to prevent recurrence
+// Enhanced Identity Risk Correlation Rule
+// Parameters
+let LookbackPeriod = 7d;              // Analysis window
+let StaleThreshold = 90d;             // Dormant account threshold
+let RecentActivityWindow = 1d;        // Recent activity detection window
+let MinSignInCountForActive = 5;      // Minimum sign-ins to consider account "active"
+let PrivilegedRoles = dynamic([
+    "Global Administrator", 
+    "Privileged Role Administrator", 
+    "Exchange Administrator",
+    "Security Administrator",
+    "Conditional Access Administrator",
+    "Application Administrator"
+]);
+
+// Helper: Get user baseline activity patterns
+let UserBaselines = 
+    SigninLogs
+    | where TimeGenerated between (ago(StaleThreshold) .. ago(RecentActivityWindow))
+    | summarize 
+        HistoricalSignIns = count(),
+        LastHistoricalSignIn = max(TimeGenerated),
+        UniqueLocations = dcount(Location),
+        UniqueApps = dcount(AppDisplayName),
+        TypicalRiskLevel = avg(RiskLevelDuringSignIn)
+    by UserPrincipalName;
+
+// Helper: Get current roles and account info
+let CurrentUserInfo = 
+    IdentityInfo
+    | where TimeGenerated >= ago(1d)
+    | summarize arg_max(TimeGenerated, *) by UserPrincipalName
+    | project UserPrincipalName, AssignedRoles, AccountEnabled, AccountType, Department, JobTitle;
+
+// Module 1: Enhanced Stale but Suddenly Active Detection
+let StaleButActive = 
+    UserBaselines
+    | where LastHistoricalSignIn < ago(StaleThreshold) or isnull(LastHistoricalSignIn)
+    | where HistoricalSignIns < MinSignInCountForActive
+    | join kind=inner (
+        SigninLogs
+        | where TimeGenerated >= ago(RecentActivityWindow)
+        | where ResultType == 0  // Successful sign-ins only
+        | summarize 
+            RecentSignIns = count(),
+            FirstRecentSignIn = min(TimeGenerated),
+            LastRecentSignIn = max(TimeGenerated),
+            UniqueRecentLocations = dcount(Location),
+            UniqueRecentApps = dcount(AppDisplayName),
+            RecentRiskEvents = countif(RiskLevelDuringSignIn > 0),
+            SuspiciousIPs = make_set_if(IPAddress, IPAddress matches regex @"^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.).*" == false and Location == ""),
+            DeviceDetails = make_set(strcat(DeviceDetail.deviceId, "|", DeviceDetail.operatingSystem))
+        by UserPrincipalName
+    ) on UserPrincipalName
+    | extend 
+        DormantDays = datetime_diff('day', LastRecentSignIn, LastHistoricalSignIn),
+        LocationAnomaly = UniqueRecentLocations > 2,  // Multiple locations in short timeframe
+        RiskScore = case(
+            RecentRiskEvents > 0 and DormantDays > 180, 95,
+            RecentRiskEvents > 0 and DormantDays > 90, 85,
+            DormantDays > 365, 80,
+            DormantDays > 180, 70,
+            60
+        )
+    | where RiskScore >= 70
+    | extend 
+        Reason = "StaleAccountSuddenActivity",
+        AccountRisk = case(RiskScore >= 90, "Critical", RiskScore >= 80, "High", "Medium"),
+        Evidence = pack(
+            "DormantDays", DormantDays,
+            "RecentSignIns", RecentSignIns,
+            "LocationAnomaly", LocationAnomaly,
+            "RiskEvents", RecentRiskEvents,
+            "SuspiciousIPs", array_length(SuspiciousIPs)
+        )
+    | project UserPrincipalName, TimeGenerated=LastRecentSignIn, AccountRisk, Reason, RiskScore, Evidence;
+
+// Module 2: Fixed Excessive Privileges Detection
+let ExcessivePrivs =
+    CurrentUserInfo
+    | where AssignedRoles has_any (PrivilegedRoles) and AccountEnabled == true
+    | join kind=leftouter (
+        SigninLogs
+        | where TimeGenerated >= ago(StaleThreshold)
+        | where ResultType == 0
+        | summarize 
+            TotalSignIns = count(),
+            LastActivity = max(TimeGenerated),
+            AdminActions = countif(AppDisplayName contains "Admin" or AppDisplayName contains "Management")
+        by UserPrincipalName
+    ) on UserPrincipalName
+    // Fixed logic: Handle accounts with no sign-ins (null values after left join)
+    | extend 
+        TotalSignIns = iif(isnull(TotalSignIns), 0, TotalSignIns),
+        DaysSinceLastActivity = iif(isnull(LastActivity), StaleThreshold/1d, datetime_diff('day', now(), LastActivity))
+    | where TotalSignIns == 0 or DaysSinceLastActivity > 30  // No activity or inactive for 30+ days
+    | extend 
+        RiskScore = case(
+            TotalSignIns == 0 and AssignedRoles has "Global Administrator", 95,
+            TotalSignIns == 0, 85,
+            DaysSinceLastActivity > 60, 75,
+            65
+        ),
+        Reason = "UnusedPrivilegedAccount",
+        AccountRisk = case(RiskScore >= 90, "Critical", RiskScore >= 80, "High", "Medium"),
+        Evidence = pack(
+            "AssignedRoles", AssignedRoles,
+            "TotalSignIns", TotalSignIns,
+            "DaysSinceLastActivity", DaysSinceLastActivity,
+            "Department", Department
+        )
+    | project UserPrincipalName, TimeGenerated=iif(isnull(LastActivity), now(), LastActivity), AccountRisk, Reason, RiskScore, Evidence;
+
+// Module 3: Enhanced Service Account Anomaly Detection
+let ServiceAccountAnomalies =
+    SigninLogs
+    | where TimeGenerated >= ago(RecentActivityWindow)
+    | where ResultType == 0
+    // Detect service accounts by patterns (since AccountType may not be available)
+    | where UserPrincipalName matches regex @".*svc.*|.*service.*|.*app.*|.*automation.*" 
+        or AppDisplayName contains "Service" 
+        or UserAgent contains "automation"
+    // Detect interactive signs (browser-based, not service-to-service)
+    | where UserAgent !contains "PowerShell" 
+        and UserAgent !contains "Azure CLI"
+        and UserAgent !contains "python"
+        and UserAgent !contains "curl"
+        and isnotempty(DeviceDetail.deviceId)  // Has device info suggests interactive
+    | summarize 
+        InteractiveSignIns = count(),
+        FirstSignIn = min(TimeGenerated),
+        LastSignIn = max(TimeGenerated),
+        UniqueDevices = dcount(DeviceDetail.deviceId),
+        Locations = make_set(Location),
+        Applications = make_set(AppDisplayName),
+        UserAgents = make_set(UserAgent)
+    by UserPrincipalName
+    | extend 
+        RiskScore = case(
+            UniqueDevices > 1, 95,  // Service account on multiple devices
+            InteractiveSignIns > 5, 85,  // Multiple interactive sessions
+            80
+        ),
+        Reason = "ServiceAccountInteractiveUse",
+        AccountRisk = "Critical",
+        Evidence = pack(
+            "InteractiveSignIns", InteractiveSignIns,
+            "UniqueDevices", UniqueDevices,
+            "Locations", Locations,
+            "Applications", Applications
+        )
+    | project UserPrincipalName, TimeGenerated=LastSignIn, AccountRisk, Reason, RiskScore, Evidence;
+
+// Module 4: Enhanced Sensitive Resource Access Detection
+let SensitiveResourceAccounts =
+    SigninLogs
+    | where TimeGenerated >= ago(StaleThreshold)
+    | where ResultType == 0
+    // Identify sensitive applications/resources
+    | where AppDisplayName has_any (
+        "Microsoft Graph", "Azure Portal", "Office 365", "SharePoint", "OneDrive",
+        "Exchange", "Teams Admin", "Security Center", "Compliance Center"
+    ) or AppDisplayName contains "Admin"
+    | summarize 
+        LastSensitiveAccess = max(TimeGenerated),
+        SensitiveAppCount = dcount(AppDisplayName),
+        TotalSensitiveAccess = count(),
+        SensitiveApps = make_set(AppDisplayName)
+    by UserPrincipalName
+    | where LastSensitiveAccess < ago(30d)  // No sensitive access in 30+ days
+    | join kind=inner (CurrentUserInfo) on UserPrincipalName
+    | where AccountEnabled == true  // Only flag enabled accounts
+    | extend 
+        DaysSinceLastAccess = datetime_diff('day', now(), LastSensitiveAccess),
+        RiskScore = case(
+            DaysSinceLastAccess > 180 and SensitiveAppCount >= 3, 85,
+            DaysSinceLastAccess > 90 and SensitiveAppCount >= 2, 75,
+            DaysSinceLastAccess > 60, 65,
+            55
+        )
+    | where RiskScore >= 65
+    | extend 
+        Reason = "UnusedSensitiveResourceAccess",
+        AccountRisk = case(RiskScore >= 80, "High", "Medium"),
+        Evidence = pack(
+            "DaysSinceLastAccess", DaysSinceLastAccess,
+            "SensitiveAppCount", SensitiveAppCount,
+            "SensitiveApps", SensitiveApps,
+            "Department", Department
+        )
+    | project UserPrincipalName, TimeGenerated=LastSensitiveAccess, AccountRisk, Reason, RiskScore, Evidence;
+
+// Final Correlation with Deduplication and Enrichment
+union isfuzzy=true StaleButActive, ExcessivePrivs, ServiceAccountAnomalies, SensitiveResourceAccounts
+| join kind=leftouter (CurrentUserInfo) on UserPrincipalName
+| extend 
+    // Add context for analysts
+    UserContext = pack(
+        "Department", Department,
+        "JobTitle", JobTitle,
+        "AccountType", AccountType,
+        "AccountEnabled", AccountEnabled
+    ),
+    // Adjust risk based on user context
+    AdjustedRiskScore = case(
+        Department == "IT" and Reason contains "Service", RiskScore - 10,  // IT service accounts are more expected
+        JobTitle contains "Admin" and Reason contains "Privileged", RiskScore - 5,  // Admins should have admin roles
+        RiskScore
+    )
+| extend FinalRisk = case(
+    AdjustedRiskScore >= 90, "Critical",
+    AdjustedRiskScore >= 75, "High", 
+    AdjustedRiskScore >= 60, "Medium",
+    "Low"
+)
+| where FinalRisk in ("Critical", "High", "Medium")  // Filter out low-risk items
+// Deduplicate users flagged by multiple modules (keep highest risk)
+| summarize arg_max(AdjustedRiskScore, *) by UserPrincipalName
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    AccountRisk = FinalRisk,
+    Reason,
+    RiskScore = AdjustedRiskScore,
+    Evidence,
+    UserContext
+| sort by RiskScore desc
+
+
+
+Step 1. Confirm the Trigger Reason
+•	Look at the Reason field (e.g., StaleAccountSuddenActivity, ServiceAccountInteractiveUse, UnusedPrivilegedAccount, UnusedSensitiveResourceAccess).
+•	This tells you why the account was flagged and which detection module triggered.
+Step 2. Review the Evidence
+•	Open the Evidence field (JSON pack) and validate anomalies against the reason:
+o	StaleAccountSuddenActivity → check "DormantDays", "RecentSignIns", "LocationAnomaly", "RiskEvents".
+o	ServiceAccountInteractiveUse → check "InteractiveSignIns", "UniqueDevices", "Applications", "Locations".
+o	UnusedPrivilegedAccount → check "AssignedRoles", "TotalSignIns", "DaysSinceLastActivity".
+o	UnusedSensitiveResourceAccess → check "SensitiveAppCount", "SensitiveApps", "DaysSinceLastAccess".
+Step 3. Validate Against User Context
+•	Look at UserContext to determine if the behavior is expected:
+o	Department/JobTitle → Does the role justify the activity or privileges?
+o	AccountType → Is it a service account vs. human user?
+o	AccountEnabled → Is this an active user, or should it be disabled?
+Step 4. Initial Action Decision
+•	If activity aligns with expected role → document and close.
+•	If activity is inconsistent or unexplained → escalate for deeper investigation (check related sign-ins, devices, MFA status, role assignments).
+•	If critical (e.g., dormant Global Admin suddenly active, service account interactive logon) → escalate immediately to incident response.
+
+
+
+
+
+Suspicious Account Activity - Stale or Overprovisioned Accounts
+|
+  Correlates multiple suspicious account conditions such as stale-but-suddenly-active accounts,
+  excessive privileges, service/automation accounts, and unused accounts with sensitive resource access.
+  This modular detection enables flexible tuning by commenting in/out specific modules as needed.
+
+
+id: enhanced-identity-risk-correlation
+title: Enhanced Identity Risk Correlation Rule
+description: |
+  Correlates multiple high-risk identity scenarios into a unified detection, including:
+  - Stale but suddenly active accounts
+  - Unused privileged accounts
+  - Service accounts used interactively
+  - Accounts with unused sensitive resource access
+severity: High
+status: experimental
+author: detection-engineering
+date: 2025-09-05
+tags:
+  - Identity
+  - Correlation
+  - Cloud
+datasource:
+  - SigninLogs
+  - IdentityInfo
+platform:
+  - AzureAD
+  - M365
+query: |
+  // --- Enhanced Identity Risk Correlation Rule ---
+  // Parameters
+  let LookbackPeriod = 7d;              // Analysis window
+  let StaleThreshold = 90d;             // Dormant account threshold
+  let RecentActivityWindow = 1d;        // Recent activity detection window
+  let MinSignInCountForActive = 5;      // Minimum sign-ins to consider account "active"
+  let PrivilegedRoles = dynamic([
+      "Global Administrator", 
+      "Privileged Role Administrator", 
+      "Exchange Administrator",
+      "Security Administrator",
+      "Conditional Access Administrator",
+      "Application Administrator"
+  ]);
+
+  // Helper: Get user baseline activity patterns
+  let UserBaselines = 
+      SigninLogs
+      | where TimeGenerated between (ago(StaleThreshold) .. ago(RecentActivityWindow))
+      | summarize 
+          HistoricalSignIns = count(),
+          LastHistoricalSignIn = max(TimeGenerated),
+          UniqueLocations = dcount(Location),
+          UniqueApps = dcount(AppDisplayName),
+          TypicalRiskLevel = avg(RiskLevelDuringSignIn)
+      by UserPrincipalName;
+
+  // Helper: Get current roles and account info
+  let CurrentUserInfo = 
+      IdentityInfo
+      | where TimeGenerated >= ago(1d)
+      | summarize arg_max(TimeGenerated, *) by UserPrincipalName
+      | project UserPrincipalName, AssignedRoles, AccountEnabled, AccountType, Department, JobTitle;
+
+  // --- Module 1: Stale but Suddenly Active ---
+  let StaleButActive = 
+      UserBaselines
+      | where LastHistoricalSignIn < ago(StaleThreshold) or isnull(LastHistoricalSignIn)
+      | where HistoricalSignIns < MinSignInCountForActive
+      | join kind=inner (
+          SigninLogs
+          | where TimeGenerated >= ago(RecentActivityWindow)
+          | where ResultType == 0  // Successful sign-ins only
+          | summarize 
+              RecentSignIns = count(),
+              FirstRecentSignIn = min(TimeGenerated),
+              LastRecentSignIn = max(TimeGenerated),
+              UniqueRecentLocations = dcount(Location),
+              UniqueRecentApps = dcount(AppDisplayName),
+              RecentRiskEvents = countif(RiskLevelDuringSignIn > 0),
+              SuspiciousIPs = make_set_if(IPAddress, IPAddress !startswith "10." and IPAddress !startswith "172." and IPAddress !startswith "192.168", true),
+              DeviceDetails = make_set(strcat(DeviceDetail.deviceId, "|", DeviceDetail.operatingSystem))
+          by UserPrincipalName
+      ) on UserPrincipalName
+      | extend 
+          DormantDays = datetime_diff('day', LastRecentSignIn, LastHistoricalSignIn),
+          LocationAnomaly = UniqueRecentLocations > 2,
+          RiskScore = case(
+              RecentRiskEvents > 0 and DormantDays > 180, 95,
+              RecentRiskEvents > 0 and DormantDays > 90, 85,
+              DormantDays > 365, 80,
+              DormantDays > 180, 70,
+              60
+          )
+      | where RiskScore >= 70
+      | extend 
+          Reason = "StaleAccountSuddenActivity",
+          AccountRisk = case(RiskScore >= 90, "Critical", RiskScore >= 80, "High", "Medium"),
+          Evidence = pack(
+              "DormantDays", DormantDays,
+              "RecentSignIns", RecentSignIns,
+              "LocationAnomaly", LocationAnomaly,
+              "RiskEvents", RecentRiskEvents,
+              "SuspiciousIPs", array_length(SuspiciousIPs)
+          )
+      | project UserPrincipalName, TimeGenerated=LastRecentSignIn, AccountRisk, Reason, RiskScore, Evidence;
+
+  // --- Module 2: Excessive Privileges ---
+  let ExcessivePrivs =
+      CurrentUserInfo
+      | where AssignedRoles has_any (PrivilegedRoles) and AccountEnabled == true
+      | join kind=leftouter (
+          SigninLogs
+          | where TimeGenerated >= ago(StaleThreshold)
+          | where ResultType == 0
+          | summarize 
+              TotalSignIns = count(),
+              LastActivity = max(TimeGenerated),
+              AdminActions = countif(AppDisplayName contains "Admin" or AppDisplayName contains "Management")
+          by UserPrincipalName
+      ) on UserPrincipalName
+      | extend 
+          TotalSignIns = iif(isnull(TotalSignIns), 0, TotalSignIns),
+          DaysSinceLastActivity = iif(isnull(LastActivity), StaleThreshold/1d, datetime_diff('day', now(), LastActivity))
+      | where TotalSignIns == 0 or DaysSinceLastActivity > 30
+      | extend 
+          RiskScore = case(
+              TotalSignIns == 0 and AssignedRoles has "Global Administrator", 95,
+              TotalSignIns == 0, 85,
+              DaysSinceLastActivity > 60, 75,
+              65
+          ),
+          Reason = "UnusedPrivilegedAccount",
+          AccountRisk = case(RiskScore >= 90, "Critical", RiskScore >= 80, "High", "Medium"),
+          Evidence = pack(
+              "AssignedRoles", AssignedRoles,
+              "TotalSignIns", TotalSignIns,
+              "DaysSinceLastActivity", DaysSinceLastActivity,
+              "Department", Department
+          )
+      | project UserPrincipalName, TimeGenerated=iif(isnull(LastActivity), now(), LastActivity), AccountRisk, Reason, RiskScore, Evidence;
+
+  // --- Module 3: Service Account Anomalies ---
+  let ServiceAccountAnomalies =
+      SigninLogs
+      | where TimeGenerated >= ago(RecentActivityWindow)
+      | where ResultType == 0
+      | where UserPrincipalName matches regex @".*svc.*|.*service.*|.*app.*|.*automation.*" 
+          or AppDisplayName contains "Service" 
+          or UserAgent contains "automation"
+      | where UserAgent !contains "PowerShell" and UserAgent !contains "Azure CLI" and UserAgent !contains "python" and UserAgent !contains "curl"
+      | where isnotempty(DeviceDetail.deviceId)
+      | summarize 
+          InteractiveSignIns = count(),
+          FirstSignIn = min(TimeGenerated),
+          LastSignIn = max(TimeGenerated),
+          UniqueDevices = dcount(DeviceDetail.deviceId),
+          Locations = make_set(Location),
+          Applications = make_set(AppDisplayName),
+          UserAgents = make_set(UserAgent)
+      by UserPrincipalName
+      | extend 
+          RiskScore = case(
+              UniqueDevices > 1, 95,
+              InteractiveSignIns > 5, 85,
+              80
+          ),
+          Reason = "ServiceAccountInteractiveUse",
+          AccountRisk = "Critical",
+          Evidence = pack(
+              "InteractiveSignIns", InteractiveSignIns,
+              "UniqueDevices", UniqueDevices,
+              "Locations", Locations,
+              "Applications", Applications
+          )
+      | project UserPrincipalName, TimeGenerated=LastSignIn, AccountRisk, Reason, RiskScore, Evidence;
+
+  // --- Module 4: Sensitive Resource Access ---
+  let SensitiveResourceAccounts =
+      SigninLogs
+      | where TimeGenerated >= ago(StaleThreshold)
+      | where ResultType == 0
+      | where AppDisplayName has_any (
+          "Microsoft Graph", "Azure Portal", "Office 365", "SharePoint", "OneDrive",
+          "Exchange", "Teams Admin", "Security Center", "Compliance Center"
+      ) or AppDisplayName contains "Admin"
+      | summarize 
+          LastSensitiveAccess = max(TimeGenerated),
+          SensitiveAppCount = dcount(AppDisplayName),
+          TotalSensitiveAccess = count(),
+          SensitiveApps = make_set(AppDisplayName)
+      by UserPrincipalName
+      | where LastSensitiveAccess < ago(30d)
+      | join kind=inner (CurrentUserInfo) on UserPrincipalName
+      | where AccountEnabled == true
+      | extend 
+          DaysSinceLastAccess = datetime_diff('day', now(), LastSensitiveAccess),
+          RiskScore = case(
+              DaysSinceLastAccess > 180 and SensitiveAppCount >= 3, 85,
+              DaysSinceLastAccess > 90 and SensitiveAppCount >= 2, 75,
+              DaysSinceLastAccess > 60, 65,
+              55
+          )
+      | where RiskScore >= 65
+      | extend 
+          Reason = "UnusedSensitiveResourceAccess",
+          AccountRisk = case(RiskScore >= 80, "High", "Medium"),
+          Evidence = pack(
+              "DaysSinceLastAccess", DaysSinceLastAccess,
+              "SensitiveAppCount", SensitiveAppCount,
+              "SensitiveApps", SensitiveApps,
+              "Department", Department
+          )
+      | project UserPrincipalName, TimeGenerated=LastSensitiveAccess, AccountRisk, Reason, RiskScore, Evidence;
+
+  // --- Final Correlation ---
+  union isfuzzy=true StaleButActive, ExcessivePrivs, ServiceAccountAnomalies, SensitiveResourceAccounts
+  | join kind=leftouter (CurrentUserInfo) on UserPrincipalName
+  | extend 
+      UserContext = pack(
+          "Department", Department,
+          "JobTitle", JobTitle,
+          "AccountType", AccountType,
+          "AccountEnabled", AccountEnabled
+      ),
+      AdjustedRiskScore = case(
+          Department == "IT" and Reason contains "Service", RiskScore - 10,
+          JobTitle contains "Admin" and Reason contains "Privileged", RiskScore - 5,
+          RiskScore
+      )
+  | extend FinalRisk = case(
+      AdjustedRiskScore >= 90, "Critical",
+      AdjustedRiskScore >= 75, "High", 
+      AdjustedRiskScore >= 60, "Medium",
+      "Low"
+  )
+  | where FinalRisk in ("Critical", "High", "Medium")
+  | summarize arg_max(AdjustedRiskScore, *) by UserPrincipalName
+  | project 
+      TimeGenerated,
+      UserPrincipalName,
+      AccountRisk = FinalRisk,
+      Reason,
+      RiskScore = AdjustedRiskScore,
+      Evidence,
+      UserContext
+  | sort by RiskScore desc
+entities:
+  - type: user
+    field: UserPrincipalName
+fields_returned:
+  - TimeGenerated
+  - UserPrincipalName
+  - AccountRisk
+  - Reason
+  - RiskScore
+  - Evidence
+  - UserContext
+triage: |
+  Follow this simplified playbook when triaging alerts:
+
+  1. **Confirm the Trigger Reason**  
+     - Review the `Reason` field (e.g., `StaleAccountSuddenActivity`, `ServiceAccountInteractiveUse`).  
+
+  2. **Review the Evidence**  
+     - Open the `Evidence` JSON and confirm anomalies align with the `Reason`.  
+       - Example: if `Reason=StaleAccountSuddenActivity`, check `DormantDays`, `RecentSignIns`, `LocationAnomaly`, `RiskEvents`.  
+       - Example: if `Reason=UnusedPrivilegedAccount`, check `AssignedRoles`, `TotalSignIns`, `DaysSinceLastActivity`.  
+
+  3. **Validate Against User Context**  
+     - Use the `UserContext` field (`Department`, `JobTitle`, `AccountType`, `AccountEnabled`) to determine whether the activity fits the expected profile.  
+
+  4. **Initial Action Decision**  
+     - If activity aligns with expected role → document and close.  
+     - If inconsistent or unexplained → escalate for investigation.  
+     - If critical (e.g., dormant Global Admin suddenly active, service account interactive logon) → escalate immediately to incident response.  
