@@ -279,3 +279,223 @@ triage:
     - Review recent sign-ins for geolocation anomalies or risky logins.
     - Assess if the mailbox contents were accessed or exported after enumeration.
     - Escalate if activity appears automated, bursty, or conducted via unrecognized apps/IPs.
+
+
+
+
+v2
+
+// Enhanced Mailbox Enumeration Detection via Graph API
+// Parameters
+let TimeWindow = 4h;                    // Analysis window
+let ShortTimeWindow = 15m;              // Burst detection window
+let BaselineWindow = 7d;                // Historical baseline period
+let EnumerationThreshold = 50;          // Operations per burst window
+let BaselineMultiplier = 3.0;           // Deviation from baseline
+let MinimumOperations = 20;             // Minimum ops to consider suspicious
+
+// Define Graph API operations related to mailbox/user enumeration
+let MailboxEnumerationOps = dynamic([
+    "Get user",
+    "List users", 
+    "Get group",
+    "List groups",
+    "Get mail",
+    "List messages",
+    "Get message",
+    "List mailFolders",
+    "Get mailFolder", 
+    "List contacts",
+    "Get contact",
+    "Search messages",
+    "List directoryObjects",
+    "Get directoryObject",
+    "List members",
+    "Get member",
+    "List transitiveMembers"
+]);
+
+// Helper: Get user baselines for comparison
+let UserBaselines = 
+    AuditLogs
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(TimeWindow))
+    | where OperationName in (MailboxEnumerationOps)
+    | where isnotempty(InitiatedBy.user.userPrincipalName)
+    | summarize 
+        BaselineOpsPerHour = count() / (BaselineWindow / 1h),
+        BaselineDistinctOps = dcount(OperationName),
+        BaselineApps = dcount(AppId),
+        HistoricalActivity = count()
+    by UserPrincipalName = tostring(InitiatedBy.user.userPrincipalName);
+
+// Helper: Identify high-risk applications and contexts
+let SuspiciousContext = 
+    AuditLogs
+    | where TimeGenerated >= ago(TimeWindow)
+    | where OperationName in (MailboxEnumerationOps)
+    | where isnotempty(InitiatedBy.user.userPrincipalName)
+    | extend 
+        UserPrincipalName = tostring(InitiatedBy.user.userPrincipalName),
+        SourceIP = tostring(InitiatedBy.user.ipAddress),
+        AppName = tostring(AppDisplayName),
+        UserAgent = tostring(UserAgent)
+    // Risk indicators
+    | extend 
+        IsNewApp = AppName !in ("Microsoft Graph Explorer", "Azure Portal", "PowerShell", "Azure CLI"),
+        IsUnusualUA = UserAgent contains "curl" or UserAgent contains "python" or UserAgent contains "PowerShell" or UserAgent == "",
+        IsExternalIP = not(ipv4_is_private(SourceIP)) and SourceIP != "",
+        HasRiskFlags = RiskState == "atRisk" or RiskLevelAggregated != "none"
+    | project-away InitiatedBy;
+
+// Main detection logic
+let EnumerationEvents = 
+    SuspiciousContext
+    | summarize 
+        TotalOperations = count(),
+        DistinctOperations = dcount(OperationName),
+        DistinctTargets = dcount(TargetResources),
+        DistinctApps = dcount(AppId),
+        UniqueIPs = dcount(SourceIP),
+        FirstActivity = min(TimeGenerated),
+        LastActivity = max(TimeGenerated),
+        Operations = make_set(OperationName, 10),
+        Applications = make_set(AppName, 5),
+        SourceIPs = make_set(SourceIP, 5),
+        UserAgents = make_set(UserAgent, 3),
+        // Risk flags
+        NewAppCount = countif(IsNewApp),
+        UnusualUACount = countif(IsUnusualUA), 
+        ExternalIPCount = countif(IsExternalIP),
+        RiskFlagCount = countif(HasRiskFlags),
+        // Burst analysis
+        MaxBurstOps = 0  // Will calculate separately
+    by UserPrincipalName, bin(TimeGenerated, ShortTimeWindow)
+    | where TotalOperations >= MinimumOperations;
+
+// Calculate burst patterns
+let BurstAnalysis = 
+    SuspiciousContext
+    | summarize BurstOps = count() by UserPrincipalName, bin(TimeGenerated, ShortTimeWindow)
+    | summarize 
+        MaxBurst = max(BurstOps),
+        AvgBurst = avg(BurstOps),
+        BurstWindows = count()
+    by UserPrincipalName;
+
+// Combine enumeration events with burst analysis and baselines
+let CombinedAnalysis = 
+    EnumerationEvents
+    | summarize 
+        TotalOps = sum(TotalOperations),
+        MaxDistinctOps = max(DistinctOperations),
+        MaxDistinctTargets = max(DistinctTargets),
+        TotalApps = max(DistinctApps),
+        TotalIPs = max(UniqueIPs),
+        ActivityStart = min(FirstActivity),
+        ActivityEnd = max(LastActivity),
+        AllOperations = make_set(Operations),
+        AllApplications = make_set(Applications), 
+        AllSourceIPs = make_set(SourceIPs),
+        AllUserAgents = make_set(UserAgents),
+        TotalNewApps = sum(NewAppCount),
+        TotalUnusualUA = sum(UnusualUACount),
+        TotalExternalIPs = sum(ExternalIPCount),
+        TotalRiskFlags = sum(RiskFlagCount),
+        ActiveWindows = count()
+    by UserPrincipalName
+    | join kind=leftouter (BurstAnalysis) on UserPrincipalName
+    | join kind=leftouter (UserBaselines) on UserPrincipalName;
+
+// Apply detection logic with scoring
+CombinedAnalysis
+| extend 
+    // Handle users with no baseline (new accounts)
+    BaselineOpsPerHour = iif(isnull(BaselineOpsPerHour), 0.0, BaselineOpsPerHour),
+    ExpectedOpsInWindow = BaselineOpsPerHour * (TimeWindow / 1h),
+    
+    // Calculate anomaly factors
+    VolumeAnomaly = iif(ExpectedOpsInWindow > 0, TotalOps / ExpectedOpsInWindow, TotalOps / 10.0),
+    BurstAnomaly = iif(isnull(MaxBurst), 1.0, MaxBurst / 10.0),
+    
+    // Risk scoring
+    VolumeScore = case(
+        TotalOps > EnumerationThreshold * 2, 30,
+        TotalOps > EnumerationThreshold, 20,
+        VolumeAnomaly > BaselineMultiplier, 15,
+        10
+    ),
+    
+    DiversityScore = case(
+        MaxDistinctOps >= 8, 25,        // High operation diversity
+        MaxDistinctTargets > 100, 20,   // Many targets accessed
+        TotalApps > 3, 15,              // Multiple applications
+        10
+    ),
+    
+    BehaviorScore = case(
+        TotalNewApps > 0 and TotalUnusualUA > 0, 25,  // New app + unusual UA
+        TotalExternalIPs > 0, 20,                      // Anomalous IP access
+        TotalRiskFlags > 0, 15,                        // Risk flags present
+        isnull(HistoricalActivity), 15,                // New user (no history)
+        5
+    ),
+    
+    PatternScore = case(
+        MaxBurst > EnumerationThreshold, 20,           // High burst activity
+        ActiveWindows == 1, 15,                        // All activity in one window
+        BurstWindows > 10, 10,                         // Sustained activity
+        5
+    )
+
+| extend 
+    TotalRiskScore = VolumeScore + DiversityScore + BehaviorScore + PatternScore,
+    ActivityDuration = datetime_diff('minute', ActivityEnd, ActivityStart)
+
+// Apply thresholds and generate alerts
+| where TotalRiskScore >= 50 or TotalOps > EnumerationThreshold
+
+| extend 
+    AlertSeverity = case(
+        TotalRiskScore >= 80, "Critical",
+        TotalRiskScore >= 65, "High", 
+        TotalRiskScore >= 50, "Medium",
+        "Low"
+    ),
+    
+    // Evidence for investigation
+    Evidence = pack(
+        "TotalOperations", TotalOps,
+        "DistinctOperations", MaxDistinctOps,
+        "DistinctTargets", MaxDistinctTargets,
+        "ActivityDuration", ActivityDuration,
+        "MaxBurst", MaxBurst,
+        "VolumeAnomaly", VolumeAnomaly,
+        "NewApplications", TotalNewApps,
+        "ExternalAccess", TotalExternalIPs > 0,
+        "RiskIndicators", TotalRiskFlags
+    ),
+    
+    Recommendations = case(
+        TotalRiskScore >= 80, "IMMEDIATE: Disable account, review all recent Graph API access, check for data exfiltration",
+        TotalRiskScore >= 65, "URGENT: Verify user identity, review application permissions, monitor for data access",
+        TotalRiskScore >= 50, "INVESTIGATE: Confirm legitimate business purpose, review access patterns",
+        "MONITOR: Document baseline behavior for future comparison"
+    )
+
+| project 
+    TimeGenerated = ActivityEnd,
+    UserPrincipalName,
+    AlertSeverity,
+    TotalRiskScore,
+    TotalOperations = TotalOps,
+    DistinctOperations = MaxDistinctOps,
+    DistinctTargets = MaxDistinctTargets,
+    ActivityDurationMinutes = ActivityDuration,
+    MaxBurstOperations = MaxBurst,
+    Applications = AllApplications,
+    SourceIPs = AllSourceIPs,
+    UserAgents = AllUserAgents,
+    Evidence,
+    Recommendations
+
+| sort by TotalRiskScore desc
