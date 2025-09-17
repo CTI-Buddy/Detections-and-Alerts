@@ -1,15 +1,360 @@
+id: ca-token-replay-correlation
+title: Conditional Access Failure followed by Token/Graph/Consent Activity (High-Fidelity Token Replay Detection)
+description: |
+  Detects potential token replay / session hijack or OAuth abuse where a Conditional Access
+  failure for a user is followed shortly after by one or more high-confidence signals such as:
+  - successful sign-in via refresh token or different IP
+  - sensitive Graph API activity (mail/files) using the same account
+  - OAuth app consent or service principal creation
+  This correlation requires the CA failure plus at least one distinct follow-on signal within a short window to reduce false positives.
+severity: High
+status: experimental
+author: bob
+date: 2025-09-05
+tags:
+  - technique:T1550.004   # Use of stolen tokens / replay
+  - technique:T1110.003   # Credential Access (contextual)
+  - technique:T1078       # Valid Accounts
+  - tactic:credential-access
+datasource:
+  - SigninLogs
+  - AuditLogs
+  - AADGraphActivity (if present)
+platform:
+  - AzureAD
+  - Microsoft365
+
+time_window: 1d
+frequency: 10m
+trigger: results > 0
+
+entities:
+  - UserAccount:
+      field: UserPrincipalName
+  - IPAddress:
+      field: SourceIPs
+  - Application:
+      field: InvolvedApps
+
 fields_returned:
-  - TimeGenerated
+  - FirstSeen
+  - LastSeen
   - UserPrincipalName
-  - AlertSeverity
-  - TotalRiskScore
-  - TotalOperations
-  - DistinctOperations
-  - DistinctTargets
-  - ActivityDurationMinutes
-  - MaxBurstOperations
-  - Applications
-  - SourceIPs
-  - UserAgents
-  - Evidence        # packed key/value object with counts & anomalies
-  - Recommendations # text guidance based on severity
+  - Severity
+  - Score
+  - Summary
+  - Signals
+  - Recommendations
+
+detection:
+  kql: |
+    // Paste the KQL block from above here (same as KQL provided)
+    // (When deploying, ensure KnownAppIds and KnownAppNames are tuned for your tenant.)
+    
+falsepositives:
+  - Legitimate users who fail a CA check (e.g., MFA) and then reauthenticate successfully from a different device or after remediation.
+  - Automated enterprise apps that legitimately use refresh tokens or service principals (add to whitelist).
+  - Admins performing emergency operations or onboarding apps.
+  
+triage:
+  - **Validate timeline**: open the CA failure event (FailTime) and examine the correlated signal(s). Confirm timestamps fall within the configured window (default 30 minutes).
+  - **Identify the follow-on signal(s)** from the `Signals` object (sensitive Graph op, token grant, OAuth consent, etc.) and prioritize `CA_then_SensitiveGraph` signals highest.
+  - **Check App context**: look up `InvolvedApps` / AppId. Are these sanctioned apps or unknown third-party apps? If unknown, treat as suspicious.
+  - **IP analysis**: compare `Fail IPs` to `Source IPs` of follow-on signals. Different public IPs shortly after CA failure increases suspicion.
+  - **Authentication method**: if `AuthMethods` contains `RefreshTokenGrant`/`refresh_token` or `Client credentials`, treat as stronger signal of token-based access.
+  - **Immediate containment (if high/critical)**:
+    - Revoke user sessions and refresh tokens (Azure AD PowerShell / MS Graph revokeSignInSessions / Revoke-AzureADUserAllRefreshToken).
+    - Disable or disable-consent any suspicious app/service principal pending investigation.
+    - Force a password reset and re-register MFA as needed.
+    - Isolate involved endpoints if endpoint telemetry shows malicious process activity.
+  - **Hunt & scope**:
+    - Search for additional Graph API calls, mailbox access, file downloads, mailbox rules, or app consent events involving the same user or same AppId.
+    - Check for other users/hosts with similar CA failure → follow-on patterns (possible campaign).
+  - **Escalation**: escalate to IR for critical findings (sensitive Graph ops, many signals, privileged account).
+  
+references:
+  - https://learn.microsoft.com/azure/active-directory/identity-protection/ (Azure AD identity protection / CA docs)
+  - Microsoft guidance on token protection and CA bypass techniques (internal security postings / blogs)
+
+
+
+
+
+
+
+// Enhanced Conditional Access Bypass Detection
+// Parameters (tune for your tenant)
+let Lookback = 4h;                     // Extended window for better correlation
+let CorrelationWindow = 45m;           // Extended follow-on window 
+let BaselineWindow = 7d;               // Historical baseline for user behavior
+let Window = toduration(strcat(CorrelationWindow, "m"));
+
+// Enhanced allow-lists (customize for your environment)
+let TrustedAppIds = dynamic([
+    "00000003-0000-0000-c000-000000000000",  // Microsoft Graph
+    "00000002-0000-0000-c000-000000000000",  // Azure AD Graph (legacy)
+    "cf36b471-5b44-428c-9ce7-313bf84528de",  // Microsoft Graph Command Line Tools
+    "14d82eec-204b-4c2f-b7e8-296a70dab67e"   // Microsoft Graph PowerShell
+]);
+
+let TrustedAppNames = dynamic([
+    "Microsoft Graph", "Office 365", "Microsoft Intune", "Azure CLI", 
+    "PowerShell", "Azure Portal", "Microsoft Graph Explorer",
+    "Microsoft Graph Command Line Tools"
+]);
+
+// Risk-based operations (expanded and categorized)
+let HighRiskGraphOps = dynamic([
+    // Email access
+    "Get message", "List messages", "Get mailFolder", "List mailFolders", 
+    "Search messages", "Export mailbox", "Get mail", "List mail",
+    // File access  
+    "Download file", "Get file", "List files", "Get drive", "List drives",
+    // Identity enumeration
+    "Get user", "List users", "Get member", "List members", "Get group", "List groups",
+    // Sensitive permissions
+    "Mail.Read", "Mail.ReadWrite", "Files.Read", "Files.ReadWrite", 
+    "Files.Read.All", "Files.ReadWrite.All", "User.Read.All", "Directory.Read.All"
+]);
+
+let MediumRiskGraphOps = dynamic([
+    "Get contact", "List contacts", "Get calendar", "List calendars",
+    "Get notebook", "List notebooks", "Get site", "List sites"
+]);
+
+// Get user behavioral baselines
+let UserBaselines = 
+    SigninLogs
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(Lookback))
+    | where ResultType == 0
+    | summarize 
+        TypicalIPs = dcount(IPAddress),
+        CommonLocations = make_set(Location, 5),
+        CommonApps = make_set(AppDisplayName, 10),
+        TypicalSigninsPerDay = count() / (BaselineWindow/1d),
+        LastSeenBefore = max(TimeGenerated)
+    by UserPrincipalName;
+
+// 1) Enhanced CA failures detection
+let CaFailures = SigninLogs
+| where TimeGenerated >= ago(Lookback)
+| where ConditionalAccessStatus == "failure" 
+    or (ConditionalAccessStatus == "notApplied" and ResultType != 0)
+| extend 
+    IsHighRiskUser = RiskLevelAggregated in ("high", "medium"),
+    IsHighRiskSignIn = RiskLevelDuringSignIn in ("high", "medium"),
+    IsFromUnusualLocation = Location !in ("") // Will enhance with baseline comparison
+| project FailTime = TimeGenerated,
+          UserPrincipalName,
+          FailIP = IPAddress,
+          FailLocation = Location,
+          FailAppId = AppId,
+          FailAppName = AppDisplayName,
+          FailClientApp = ClientAppUsed,
+          FailResult = ResultDescription,
+          IsHighRiskUser,
+          IsHighRiskSignIn,
+          FailRiskDetails = pack("UserRisk", RiskLevelAggregated, "SignInRisk", RiskLevelDuringSignIn);
+
+// 2) Enhanced follow-on success detection
+let FollowSuccess = SigninLogs
+| where TimeGenerated >= ago(Lookback)
+| where ResultType == 0
+| extend 
+    AuthMethods = tostring(AuthenticationMethods),
+    IsTokenBased = AuthenticationMethods contains "RefreshTokenGrant" 
+        or AuthenticationMethods contains "refresh_token"
+        or ClientAppUsed in ("Other", "Mobile apps and desktop clients")
+        or AuthenticationMethods contains "OAuth2"
+| project SuccessTime = TimeGenerated,
+          UserPrincipalName,
+          SuccessIP = IPAddress,
+          SuccessLocation = Location,
+          SuccessAppId = AppId,
+          SuccessAppName = AppDisplayName,
+          SuccessClientApp = ClientAppUsed,
+          AuthMethods,
+          IsTokenBased,
+          DeviceInfo = pack("DeviceId", DeviceDetail.deviceId, "OS", DeviceDetail.operatingSystem);
+
+// 3) Enhanced Graph activity detection  
+let GraphActivity = AuditLogs
+| where TimeGenerated >= ago(Lookback)
+| where OperationName has_any (HighRiskGraphOps) or OperationName has_any (MediumRiskGraphOps)
+| extend 
+    Actor = tostring(parse_json(tostring(InitiatedBy.user))["userPrincipalName"]),
+    ActorIP = tostring(parse_json(tostring(InitiatedBy.user))["ipAddress"]),
+    ActorApp = tostring(AppDisplayName),
+    ActorAppId = tostring(AppId),
+    IsHighRiskOp = OperationName in (HighRiskGraphOps),
+    TargetInfo = tostring(TargetResources)
+| where isnotempty(Actor)
+| project TimeGenerated, Actor, ActorIP, ActorApp, ActorAppId, 
+          OperationName, IsHighRiskOp, TargetInfo;
+
+// 4) Enhanced OAuth/consent detection
+let OAuthActivity = AuditLogs
+| where TimeGenerated >= ago(Lookback)
+| where OperationName has_any (
+    "Consent to application", "Add service principal", "Add app role assignment", 
+    "Add member to role", "Create service principal", "Add OAuth2PermissionGrant"
+)
+| extend 
+    Actor = tostring(parse_json(tostring(InitiatedBy.user))["userPrincipalName"]),
+    ActorIP = tostring(parse_json(tostring(InitiatedBy.user))["ipAddress"]),
+    PermissionsGranted = tostring(AdditionalDetails),
+    AppDetails = tostring(TargetResources)
+| project TimeGenerated, Actor, ActorIP, OperationName, 
+          PermissionsGranted, AppDetails, AppDisplayName;
+
+// 5) Correlation Logic with Enhanced Filtering
+
+// A) CA failure -> Different IP success or token-based auth
+let CA_Success_Correlation = CaFailures
+| join kind=inner (FollowSuccess) on UserPrincipalName
+| where SuccessTime between (FailTime .. FailTime + Window)
+| where (FailIP != SuccessIP and isnotempty(FailIP) and isnotempty(SuccessIP))
+     or IsTokenBased == true
+     or FailLocation != SuccessLocation
+| extend 
+    Signal = "CA_then_Suspicious_Success",
+    SignalTime = SuccessTime,
+    IpChange = FailIP != SuccessIP,
+    LocationChange = FailLocation != SuccessLocation,
+    Evidence = pack(
+        "FailTime", FailTime, 
+        "SuccessTime", SuccessTime,
+        "IpChange", IpChange,
+        "LocationChange", LocationChange,
+        "TokenBased", IsTokenBased,
+        "FailApp", FailAppName,
+        "SuccessApp", SuccessAppName,
+        "DeviceInfo", DeviceInfo
+    );
+
+// B) CA failure -> High-risk Graph activity 
+let CA_Graph_Correlation = CaFailures
+| join kind=inner (GraphActivity) on $left.UserPrincipalName == $right.Actor
+| where TimeGenerated between (FailTime .. FailTime + Window)
+| where ActorAppId !in (TrustedAppIds) or ActorApp !in (TrustedAppNames)
+| extend 
+    Signal = "CA_then_Graph_Activity",
+    SignalTime = TimeGenerated,
+    Evidence = pack(
+        "FailTime", FailTime,
+        "GraphTime", TimeGenerated,
+        "GraphOp", OperationName,
+        "IsHighRisk", IsHighRiskOp,
+        "GraphApp", ActorApp,
+        "GraphIP", ActorIP,
+        "TargetInfo", TargetInfo
+    );
+
+// C) CA failure -> OAuth consent/SP creation
+let CA_OAuth_Correlation = CaFailures  
+| join kind=inner (OAuthActivity) on $left.UserPrincipalName == $right.Actor
+| where TimeGenerated between (FailTime .. FailTime + Window)
+| extend 
+    Signal = "CA_then_OAuth_Activity",
+    SignalTime = TimeGenerated,
+    Evidence = pack(
+        "FailTime", FailTime,
+        "OAuthTime", TimeGenerated,
+        "Operation", OperationName,
+        "Permissions", PermissionsGranted,
+        "AppDetails", AppDetails
+    );
+
+// Combine and analyze all signals
+let AllCorrelations = union CA_Success_Correlation, CA_Graph_Correlation, CA_OAuth_Correlation
+| extend
+    User = UserPrincipalName,
+    SignalName = Signal,
+    PrimaryEvidence = Evidence,
+    SourceIP = coalesce(SuccessIP, ActorIP, FailIP),
+    InvolvedApp = coalesce(SuccessAppName, ActorApp, FailAppName),
+    RiskFactors = pack(
+        "HighRiskUser", IsHighRiskUser,
+        "HighRiskSignIn", IsHighRiskSignIn,
+        "FailRisk", FailRiskDetails
+    )
+| project SignalTime, User, SignalName, SourceIP, InvolvedApp, 
+          PrimaryEvidence, RiskFactors, FailTime;
+
+// Enhanced scoring with baseline consideration
+let ScoredCorrelations = AllCorrelations
+| join kind=leftouter (UserBaselines) on $left.User == $right.UserPrincipalName
+| extend
+    // Base signal scores
+    BaseScore = case(
+        SignalName == "CA_then_Graph_Activity", 45,
+        SignalName == "CA_then_OAuth_Activity", 40, 
+        SignalName == "CA_then_Suspicious_Success", 30,
+        10
+    ),
+    // Risk multipliers
+    RiskMultiplier = 1.0 +
+        (iif(RiskFactors.HighRiskUser == true, 0.3, 0.0)) +
+        (iif(RiskFactors.HighRiskSignIn == true, 0.2, 0.0)) +
+        (iif(isnull(LastSeenBefore), 0.2, 0.0)),  // New user
+    
+    // Calculate final score
+    FinalScore = toint(BaseScore * RiskMultiplier)
+| extend 
+    Severity = case(
+        FinalScore >= 60, "Critical",
+        FinalScore >= 45, "High", 
+        FinalScore >= 30, "Medium",
+        "Low"
+    )
+| where Severity in ("Critical", "High", "Medium");
+
+// Final aggregation and output
+ScoredCorrelations
+| summarize
+    FirstSeen = min(SignalTime),
+    LastSeen = max(SignalTime),
+    MaxSeverity = arg_max(Severity, FinalScore),
+    SignalDetails = make_list(pack(
+        "Signal", SignalName,
+        "Time", SignalTime,
+        "Score", FinalScore,
+        "Evidence", PrimaryEvidence
+    )),
+    SignalCount = count(),
+    InvolvedApps = make_set(InvolvedApp),
+    SourceIPs = make_set(SourceIP),
+    FailureCount = dcount(FailTime)
+  by User
+| extend
+    TotalRiskScore = MaxSeverity,
+    ActivitySummary = pack(
+        "SignalCount", SignalCount,
+        "FailureCount", FailureCount,
+        "Apps", InvolvedApps,
+        "IPs", SourceIPs,
+        "Duration", datetime_diff('minute', LastSeen, FirstSeen)
+    ),
+    Recommendations = case(
+        MaxSeverity == "Critical", 
+        "IMMEDIATE: Disable user account, revoke all sessions and refresh tokens, disable suspicious applications, block source IPs, escalate to incident response team",
+        MaxSeverity == "High",
+        "URGENT: Force user re-authentication, revoke tokens for suspicious applications, validate all Graph API activity, consider temporary account restrictions", 
+        MaxSeverity == "Medium",
+        "INVESTIGATE: Review user sign-in patterns, validate application legitimacy, confirm Graph API activities align with business needs",
+        "MONITOR: Document for baseline improvement"
+    )
+| project 
+    TimeGenerated = LastSeen,
+    UserPrincipalName = User,
+    AlertSeverity = MaxSeverity,
+    TotalRiskScore,
+    ActivityWindowMinutes = datetime_diff('minute', LastSeen, FirstSeen),
+    SignalCount,
+    CorrelatedFailures = FailureCount,
+    InvolvedApplications = InvolvedApps,
+    SourceIPs,
+    SignalDetails,
+    ActivitySummary,
+    Recommendations
+| sort by TotalRiskScore desc, TimeGenerated desc
