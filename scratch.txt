@@ -1,51 +1,203 @@
-Confirm Alert Context
-•	Review SignalDetails in the alert payload:
-o	Signal – which path fired:
-	CA_then_Suspicious_Success
-	CA_then_Graph_Activity
-	CA_then_OAuth_Activity
-o	Evidence – correlated times, IP changes, token-based sign-in flags, Graph operation names, OAuth permissions, etc.
-•	Severity & Score
-o	AlertSeverity and TotalRiskScore are already computed; use them to prioritize.
-________________________________________
-2️⃣ Validate Conditional Access (CA) Failure
-•	Open SigninLogs around FailTime for the user:
-o	Confirm ConditionalAccessStatus == failure or notApplied with non-zero ResultType.
-o	Note policy name and failure reason to see which CA control was bypassed.
-•	Compare FailIP / FailLocation to baseline user activity.
-________________________________________
-3️⃣ Investigate the Follow-on Signal
-Perform only the branch(s) shown in SignalDetails:
-•	A. Suspicious Success Sign-In
-o	Check SuccessTime, SuccessIP, AuthMethods.
-o	If IsTokenBased == true, verify whether refresh tokens or OAuth2 grants were expected.
-o	Compare DeviceInfo to known user devices.
-•	B. High-Risk Graph Activity
-o	Look at OperationName, ActorApp, TargetInfo.
-o	Verify the app (ActorAppId) is not in your approved/Trusted lists.
-o	Correlate with mailbox or file access patterns.
-•	C. OAuth / Service Principal Creation
-o	Review PermissionsGranted and AppDetails.
-o	Confirm whether a new service principal or consent event was authorized by the user or admin.
-________________________________________
-4️⃣ Baseline & Behavior Check
-•	Compare against UserBaselines (if stored separately):
-o	Typical IP count (TypicalIPs), common locations (CommonLocations), and common apps.
-o	Check LastSeenBefore to see if the user is new or dormant.
-________________________________________
-5️⃣ Containment & Remediation
-Severity-aligned actions (already suggested in Recommendations field):
-•	Critical / High
-o	Disable the user account or force password reset.
-o	Revoke refresh tokens and active sessions (Revoke-AzureADUserAllRefreshToken or equivalent).
-o	Block suspicious app IDs and IPs.
-o	Escalate to incident response.
-•	Medium
-o	Force re-authentication and review Graph/OAuth actions with the user.
-o	Validate whether permissions or app registrations were legitimate.
-________________________________________
-6️⃣ Documentation & Lessons Learned
-•	Record timeline of CA failure, follow-on action, and containment.
-•	Update allow-lists (TrustedAppIds, TrustedAppNames) if you confirm benign automation.
-•	Feed confirmed malicious Graph ops back into threat-hunting or detection rules.
+// PowerShell Parent Process Evasion Detection
+// High-fidelity approach focusing on suspicious parent-child combinations
 
+// Parameters
+let LookbackWindow = 4h;
+let BaselineWindow = 14d;
+
+// Known legitimate parent processes (customize for your environment)
+let LegitimateParents = dynamic([
+    // System processes
+    "explorer.exe", "cmd.exe", "winlogon.exe", "services.exe", "svchost.exe",
+    "powershell.exe", "powershell_ise.exe", "pwsh.exe",
+    // Management tools
+    "mmc.exe", "servermanager.exe", "wsmprovhost.exe", "winrm.exe",
+    // Installers (common patterns)
+    "msiexec.exe", "setup.exe", "install.exe", "update.exe",
+    // Enterprise software (add your specific tools)
+    "veeam.backup.service.exe", "commvault.exe", "psexec.exe", "psexec64.exe"
+]);
+
+// Suspicious parent processes (high confidence indicators)
+let SuspiciousParents = dynamic([
+    // Browsers (should rarely spawn PowerShell directly)
+    "iexplore.exe", "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe",
+    // Office applications (macro-based attacks)
+    "winword.exe", "excel.exe", "powerpnt.exe", "msaccess.exe", "visio.exe", "project.exe",
+    // PDF readers (document-based attacks)
+    "acrord32.exe", "foxitreader.exe", "sumatra.exe",
+    // Media players (less common attack vector)
+    "wmplayer.exe", "vlc.exe", "mpc-hc64.exe",
+    // Chat/communication
+    "teams.exe", "slack.exe", "discord.exe", "zoom.exe",
+    // Uncommon system utilities
+    "regsvr32.exe", "rundll32.exe", "mshta.exe", "cscript.exe", "wscript.exe",
+    "certutil.exe", "bitsadmin.exe", "regasm.exe", "installutil.exe"
+]);
+
+// Evasion-related parent processes (living off the land binaries)
+let EvasionParents = dynamic([
+    "rundll32.exe", "regsvr32.exe", "mshta.exe", "wmic.exe",
+    "certutil.exe", "bitsadmin.exe", "forfiles.exe", "pcalua.exe",
+    "regasm.exe", "regsvcs.exe", "installutil.exe", "msxsl.exe",
+    "sqltoolsps.exe", "sqlps.exe", "brokerhost.exe"
+]);
+
+// Get baseline PowerShell parent patterns
+let ParentBaselines = 
+    DeviceProcessEvents
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(LookbackWindow))
+    | where ProcessCommandLine contains "powershell" 
+        or FileName in~ ("powershell.exe", "pwsh.exe")
+    | summarize 
+        BaselineCount = count(),
+        CommonArgs = make_set(ProcessCommandLine, 10),
+        Frequency = count() / (BaselineWindow / 1d)
+    by InitiatingProcessFileName = tolower(InitiatingProcessParentFileName), DeviceName;
+
+// Current PowerShell executions
+let PowerShellEvents = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where FileName in~ ("powershell.exe", "pwsh.exe") 
+    or ProcessCommandLine contains "powershell"
+| extend 
+    ParentProcess = tolower(InitiatingProcessParentFileName),
+    ParentPID = InitiatingProcessParentId,
+    ParentCommandLine = InitiatingProcessParentCommandLine,
+    PSCommandLine = ProcessCommandLine,
+    // Classification flags
+    IsLegitimateParent = ParentProcess in (LegitimateParents),
+    IsSuspiciousParent = ParentProcess in (SuspiciousParents), 
+    IsEvasionParent = ParentProcess in (EvasionParents),
+    // Command line analysis
+    HasSuspiciousArgs = ProcessCommandLine has_any (
+        "-enc", "-EncodedCommand", "-WindowStyle Hidden", "-ExecutionPolicy Bypass",
+        "-NoProfile", "-NonInteractive", "IEX", "Invoke-Expression", 
+        "DownloadString", "DownloadFile", "webclient", "Net.WebClient",
+        "-Command &", "FromBase64String", "System.Convert", "[Convert]"
+    ),
+    HasNetworkActivity = ProcessCommandLine has_any (
+        "http://", "https://", "ftp://", "Invoke-WebRequest", "curl", 
+        "wget", "Start-BitsTransfer", "Net.Sockets"
+    ),
+    HasFileOperations = ProcessCommandLine has_any (
+        "Out-File", "Set-Content", "Add-Content", "Copy-Item", "Move-Item",
+        ">", ">>", "New-Item", "Remove-Item"
+    ),
+    HasRegistryOps = ProcessCommandLine has_any (
+        "New-ItemProperty", "Set-ItemProperty", "Remove-ItemProperty",
+        "HKLM:", "HKCU:", "Registry::"
+    ),
+    IsShortLived = ProcessCommandLine contains "-Command" and 
+        (strlen(ProcessCommandLine) > 200 or ProcessCommandLine contains ";")
+| project TimeGenerated, DeviceName, DeviceId, FileName, ProcessCommandLine,
+          ParentProcess, ParentPID, ParentCommandLine, AccountName, AccountDomain,
+          IsLegitimateParent, IsSuspiciousParent, IsEvasionParent,
+          HasSuspiciousArgs, HasNetworkActivity, HasFileOperations, 
+          HasRegistryOps, IsShortLived;
+
+// Correlation with baselines and scoring
+let AnalyzedEvents = PowerShellEvents
+| join kind=leftouter (ParentBaselines) on $left.ParentProcess == $right.InitiatingProcessFileName, DeviceName
+| extend
+    // Rarity scoring
+    IsRareParent = isnull(BaselineCount) or BaselineCount < 5,
+    IsVeryRareParent = isnull(BaselineCount) or BaselineCount < 2,
+    
+    // Risk scoring
+    ParentRiskScore = case(
+        IsEvasionParent, 50,           // LOLBAS parents
+        IsSuspiciousParent, 40,        // Browsers, Office apps
+        IsVeryRareParent, 30,          // Never/rarely seen parent
+        IsRareParent, 20,              // Infrequently seen parent
+        not(IsLegitimateParent), 15,   // Not in known good list
+        5                              // Baseline legitimate
+    ),
+    
+    ArgumentRiskScore = case(
+        HasSuspiciousArgs and HasNetworkActivity, 40,  // Encoded + network
+        HasSuspiciousArgs and (HasFileOperations or HasRegistryOps), 35,
+        HasSuspiciousArgs, 25,         // Obfuscation/evasion args
+        HasNetworkActivity, 20,        // Network operations
+        IsShortLived, 15,              // One-liner execution
+        HasFileOperations or HasRegistryOps, 10,
+        5                              // Standard execution
+    ),
+    
+    TotalRiskScore = ParentRiskScore + ArgumentRiskScore
+
+| extend
+    AlertSeverity = case(
+        TotalRiskScore >= 80, "Critical",
+        TotalRiskScore >= 60, "High",
+        TotalRiskScore >= 40, "Medium", 
+        "Low"
+    );
+
+// High-fidelity filtering and final output
+AnalyzedEvents
+| where AlertSeverity in ("Critical", "High", "Medium")
+| extend
+    Evidence = pack(
+        "ParentProcess", ParentProcess,
+        "ParentCommandLine", ParentCommandLine,
+        "PowerShellCommand", PSCommandLine,
+        "BaselineFrequency", iif(isnull(Frequency), 0.0, Frequency),
+        "SuspiciousFlags", pack(
+            "EvasionParent", IsEvasionParent,
+            "SuspiciousParent", IsSuspiciousParent,
+            "SuspiciousArgs", HasSuspiciousArgs,
+            "NetworkActivity", HasNetworkActivity,
+            "RareParent", IsRareParent
+        )
+    ),
+    
+    Recommendations = case(
+        AlertSeverity == "Critical",
+        "IMMEDIATE: Isolate endpoint, analyze PowerShell execution, check for lateral movement, review parent process legitimacy",
+        AlertSeverity == "High", 
+        "URGENT: Investigate parent process and PowerShell command, check for persistence mechanisms, validate user activity",
+        AlertSeverity == "Medium",
+        "INVESTIGATE: Review execution context, validate business justification, check for similar patterns across environment",
+        "MONITOR: Document for baseline tuning"
+    ),
+    
+    // MITRE ATT&CK techniques
+    DetectedTechniques = case(
+        IsEvasionParent, "T1218 (Signed Binary Proxy Execution)",
+        IsSuspiciousParent and HasSuspiciousArgs, "T1566.001 (Spearphishing Attachment) + T1059.001 (PowerShell)",
+        HasSuspiciousArgs, "T1059.001 (Command and Scripting Interpreter: PowerShell)",
+        "T1059.001 (Command and Scripting Interpreter: PowerShell)"
+    )
+
+| project
+    TimeGenerated,
+    DeviceName, 
+    DeviceId,
+    AccountName,
+    AccountDomain,
+    AlertSeverity,
+    TotalRiskScore,
+    ParentProcess,
+    PowerShellCommand = PSCommandLine,
+    Evidence,
+    DetectedTechniques,
+    Recommendations
+
+| sort by TotalRiskScore desc, TimeGenerated desc
+
+// Additional query for parent process anomaly detection
+// (Run separately for environment assessment)
+/*
+DeviceProcessEvents
+| where TimeGenerated >= ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| summarize 
+    ExecutionCount = count(),
+    UniqueDevices = dcount(DeviceName),
+    SampleCommands = make_set(ProcessCommandLine, 5)
+by ParentProcess = tolower(InitiatingProcessParentFileName)
+| where ExecutionCount > 0
+| sort by ExecutionCount asc
+| extend Rarity = case(ExecutionCount <= 5, "Very Rare", ExecutionCount <= 20, "Rare", ExecutionCount <= 100, "Uncommon", "Common")
+*/
