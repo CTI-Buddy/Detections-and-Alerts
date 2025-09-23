@@ -1,9 +1,10 @@
-// PowerShell Parent Process Evasion Detection
-// High-fidelity approach focusing on suspicious parent-child combinations
+// PowerShell Parent Process Evasion Detection with Entropy Analysis
+// High-fidelity approach focusing on suspicious parent-child combinations + obfuscation
 
 // Parameters
 let LookbackWindow = 4h;
 let BaselineWindow = 14d;
+let EntropyThreshold = 4.5; // Adjust based on environment noise
 
 // Known legitimate parent processes (customize for your environment)
 let LegitimateParents = dynamic([
@@ -43,17 +44,27 @@ let EvasionParents = dynamic([
     "sqltoolsps.exe", "sqlps.exe", "brokerhost.exe"
 ]);
 
-// Get baseline PowerShell parent patterns
+// Get baseline PowerShell parent patterns with entropy analysis
 let ParentBaselines = 
     DeviceProcessEvents
     | where TimeGenerated between (ago(BaselineWindow) .. ago(LookbackWindow))
     | where ProcessCommandLine contains "powershell" 
         or FileName in~ ("powershell.exe", "pwsh.exe")
+    | extend 
+        ParentProcess = tolower(InitiatingProcessParentFileName),
+        // Calculate entropy using character frequency analysis
+        CommandLength = strlen(ProcessCommandLine),
+        UniqueChars = array_length(split(replace_regex(ProcessCommandLine, @"(.)", "\\1|"), "|"))
+    | extend 
+        // Simplified entropy approximation: unique chars / total length
+        ApproxEntropy = todouble(UniqueChars) / todouble(CommandLength) * 10.0
     | summarize 
         BaselineCount = count(),
-        CommonArgs = make_set(ProcessCommandLine, 10),
-        Frequency = count() / (BaselineWindow / 1d)
-    by InitiatingProcessFileName = tolower(InitiatingProcessParentFileName), DeviceName;
+        AvgEntropy = avg(ApproxEntropy),
+        MaxEntropy = max(ApproxEntropy),
+        Frequency = count() / (BaselineWindow / 1d),
+        CommonArgs = make_set(ProcessCommandLine, 5)
+    by ParentProcess, DeviceName;
 
 // Current PowerShell executions
 let PowerShellEvents = DeviceProcessEvents
@@ -96,45 +107,56 @@ let PowerShellEvents = DeviceProcessEvents
           HasSuspiciousArgs, HasNetworkActivity, HasFileOperations, 
           HasRegistryOps, IsShortLived;
 
-// Correlation with baselines and scoring
+// Correlation with baselines and enhanced scoring
 let AnalyzedEvents = PowerShellEvents
-| join kind=leftouter (ParentBaselines) on $left.ParentProcess == $right.InitiatingProcessFileName, DeviceName
+| join kind=leftouter (ParentBaselines) on ParentProcess, DeviceName
 | extend
+    // Baseline comparison for entropy
+    EntropyAnomaly = ApproxEntropy > (AvgEntropy + 2.0), // 2 standard deviations above normal
+    IsVeryHighEntropy = ApproxEntropy > (EntropyThreshold + 1.0),
+    
     // Rarity scoring
     IsRareParent = isnull(BaselineCount) or BaselineCount < 5,
     IsVeryRareParent = isnull(BaselineCount) or BaselineCount < 2,
     
-    // Risk scoring
+    // Enhanced risk scoring with entropy weight
     ParentRiskScore = case(
-        IsEvasionParent, 50,           // LOLBAS parents
+        IsEvasionParent, 50,           // LOLBAS parents (highest risk)
         IsSuspiciousParent, 40,        // Browsers, Office apps
-        IsVeryRareParent, 30,          // Never/rarely seen parent
-        IsRareParent, 20,              // Infrequently seen parent
-        not(IsLegitimateParent), 15,   // Not in known good list
-        5                              // Baseline legitimate
+        IsVeryRareParent, 35,          // Never/rarely seen parent
+        IsRareParent, 25,              // Infrequently seen parent
+        not(IsLegitimateParent), 20,   // Not in known good list
+        10                             // Baseline legitimate
     ),
     
+    // Argument risk scoring with heavy entropy weighting
     ArgumentRiskScore = case(
-        HasSuspiciousArgs and HasNetworkActivity, 40,  // Encoded + network
-        HasSuspiciousArgs and (HasFileOperations or HasRegistryOps), 35,
-        HasSuspiciousArgs, 25,         // Obfuscation/evasion args
-        HasNetworkActivity, 20,        // Network operations
-        IsShortLived, 15,              // One-liner execution
-        HasFileOperations or HasRegistryOps, 10,
-        5                              // Standard execution
+        (IsEncodedCommand or IsLikelyBase64) and IsVeryHighEntropy and HasNetworkActivity, 60, // Encoded + high entropy + network
+        (IsEncodedCommand or IsLikelyBase64) and IsHighEntropy, 50, // Encoded + high entropy
+        IsVeryHighEntropy and HasNetworkActivity, 45,              // Very high entropy + network
+        IsEncodedCommand or IsLikelyBase64, 40,                    // Base64 encoding detected
+        IsHighEntropy and HasSuspiciousArgs, 35,                   // High entropy + suspicious args
+        EntropyAnomaly and HasObfuscation, 30,                     // Entropy anomaly + obfuscation
+        IsHighEntropy, 25,                                         // High entropy alone
+        HasSuspiciousArgs and HasNetworkActivity, 20,              // Suspicious args + network
+        HasSuspiciousArgs and HasObfuscation, 18,                  // Suspicious args + obfuscation
+        HasNetworkActivity, 15,                                    // Network activity
+        HasSuspiciousArgs, 12,                                     // Suspicious arguments
+        HasObfuscation, 10,                                        // Obfuscation techniques
+        5                                                          // Standard execution
     ),
     
     TotalRiskScore = ParentRiskScore + ArgumentRiskScore
 
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 80, "Critical",
-        TotalRiskScore >= 60, "High",
-        TotalRiskScore >= 40, "Medium", 
+        TotalRiskScore >= 90, "Critical",
+        TotalRiskScore >= 70, "High",
+        TotalRiskScore >= 45, "Medium", 
         "Low"
     );
 
-// High-fidelity filtering and final output
+// High-fidelity filtering and final output with enhanced evidence
 AnalyzedEvents
 | where AlertSeverity in ("Critical", "High", "Medium")
 | extend
@@ -142,33 +164,43 @@ AnalyzedEvents
         "ParentProcess", ParentProcess,
         "ParentCommandLine", ParentCommandLine,
         "PowerShellCommand", PSCommandLine,
+        "EntropyMetrics", pack(
+            "ApproxEntropy", ApproxEntropy,
+            "BaselineAvgEntropy", iif(isnull(AvgEntropy), 0.0, AvgEntropy),
+            "IsHighEntropy", IsHighEntropy,
+            "EntropyAnomaly", EntropyAnomaly
+        ),
         "BaselineFrequency", iif(isnull(Frequency), 0.0, Frequency),
-        "SuspiciousFlags", pack(
+        "DetectionFlags", pack(
             "EvasionParent", IsEvasionParent,
             "SuspiciousParent", IsSuspiciousParent,
+            "EncodedCommand", IsEncodedCommand,
+            "LikelyBase64", IsLikelyBase64,
             "SuspiciousArgs", HasSuspiciousArgs,
             "NetworkActivity", HasNetworkActivity,
+            "ObfuscationTechniques", HasObfuscation,
             "RareParent", IsRareParent
         )
     ),
     
     Recommendations = case(
         AlertSeverity == "Critical",
-        "IMMEDIATE: Isolate endpoint, analyze PowerShell execution, check for lateral movement, review parent process legitimacy",
+        "IMMEDIATE: Isolate endpoint, decode/analyze PowerShell command, check for lateral movement and data exfiltration, investigate parent process legitimacy",
         AlertSeverity == "High", 
-        "URGENT: Investigate parent process and PowerShell command, check for persistence mechanisms, validate user activity",
+        "URGENT: Decode PowerShell execution, investigate parent process context, check for persistence mechanisms, validate user activity and business justification",
         AlertSeverity == "Medium",
-        "INVESTIGATE: Review execution context, validate business justification, check for similar patterns across environment",
+        "INVESTIGATE: Review execution context and entropy patterns, validate business justification, check for similar obfuscation patterns across environment",
         "MONITOR: Document for baseline tuning"
     ),
     
-    // MITRE ATT&CK techniques
-    DetectedTechniques = case(
-        IsEvasionParent, "T1218 (Signed Binary Proxy Execution)",
-        IsSuspiciousParent and HasSuspiciousArgs, "T1566.001 (Spearphishing Attachment) + T1059.001 (PowerShell)",
-        HasSuspiciousArgs, "T1059.001 (Command and Scripting Interpreter: PowerShell)",
-        "T1059.001 (Command and Scripting Interpreter: PowerShell)"
-    )
+    // Enhanced MITRE ATT&CK techniques based on detection flags
+    DetectedTechniques = strcat_array(
+        iff(IsEvasionParent, dynamic(["T1218 (Signed Binary Proxy Execution)"]), dynamic([])),
+        iff(IsEncodedCommand or IsLikelyBase64 or IsHighEntropy, dynamic(["T1027 (Obfuscated Files or Information)"]), dynamic([])),
+        iff(HasObfuscation, dynamic(["T1027.010 (Command Obfuscation)"]), dynamic([])),
+        iff(HasNetworkActivity, dynamic(["T1105 (Ingress Tool Transfer)"]), dynamic([])),
+        dynamic(["T1059.001 (Command and Scripting Interpreter: PowerShell)"])
+    , ", ")
 
 | project
     TimeGenerated,
@@ -180,6 +212,7 @@ AnalyzedEvents
     TotalRiskScore,
     ParentProcess,
     PowerShellCommand = PSCommandLine,
+    EntropyScore = ApproxEntropy,
     Evidence,
     DetectedTechniques,
     Recommendations
@@ -201,3 +234,178 @@ by ParentProcess = tolower(InitiatingProcessParentFileName)
 | sort by ExecutionCount asc
 | extend Rarity = case(ExecutionCount <= 5, "Very Rare", ExecutionCount <= 20, "Rare", ExecutionCount <= 100, "Uncommon", "Common")
 */
+
+
+
+
+////////
+
+
+
+
+id: powershell_parent_entropy_detection
+name: PowerShell Parent Process Evasion with Entropy Analysis
+description: >
+  Detects suspicious PowerShell executions launched from unusual or high-risk parent processes,
+  combined with obfuscated or high-entropy command lines. Uses a 14-day baseline to score rarity,
+  parent legitimacy, argument risk factors, and entropy anomalies. Produces a single TotalRiskScore
+  and AlertSeverity for simplified triage.
+severity: High
+status: Experimental
+author: Your Team
+date: 2025-09-17
+tags:
+  - powershell
+  - lolbas
+  - obfuscation
+  - entropy
+  - correlation
+mitre_attack:
+  - technique: T1059.001     # Command and Scripting Interpreter: PowerShell
+  - technique: T1027         # Obfuscated Files or Information
+  - subtechnique: T1027.010  # Obfuscated Files or Information: Command Obfuscation
+  - technique: T1105         # Ingress Tool Transfer
+  - technique: T1218         # Signed Binary Proxy Execution (LOLBAS parents)
+datasource:
+  - Microsoft Defender for Endpoint
+  - Microsoft 365 Defender
+platform:
+  - Windows
+query: |
+  // High-fidelity PowerShell Parent-Process Evasion Detection with Entropy Analysis
+  // ----------------------------------------------
+  let LookbackWindow = 4h;
+  let BaselineWindow = 14d;
+  let EntropyThreshold = 4.5;
+  let LegitimateParents = dynamic(["explorer.exe","cmd.exe","winlogon.exe","services.exe","svchost.exe",
+                                   "powershell.exe","powershell_ise.exe","pwsh.exe",
+                                   "mmc.exe","servermanager.exe","wsmprovhost.exe","winrm.exe",
+                                   "msiexec.exe","setup.exe","install.exe","update.exe",
+                                   "veeam.backup.service.exe","commvault.exe","psexec.exe","psexec64.exe"]);
+  let SuspiciousParents = dynamic(["iexplore.exe","chrome.exe","msedge.exe","firefox.exe","opera.exe",
+                                   "winword.exe","excel.exe","powerpnt.exe","msaccess.exe","visio.exe","project.exe",
+                                   "acrord32.exe","foxitreader.exe","sumatra.exe",
+                                   "wmplayer.exe","vlc.exe","mpc-hc64.exe",
+                                   "teams.exe","slack.exe","discord.exe","zoom.exe",
+                                   "regsvr32.exe","rundll32.exe","mshta.exe","cscript.exe","wscript.exe",
+                                   "certutil.exe","bitsadmin.exe","regasm.exe","installutil.exe"]);
+  let EvasionParents = dynamic(["rundll32.exe","regsvr32.exe","mshta.exe","wmic.exe","certutil.exe","bitsadmin.exe",
+                                "forfiles.exe","pcalua.exe","regasm.exe","regsvcs.exe","installutil.exe",
+                                "msxsl.exe","sqltoolsps.exe","sqlps.exe","brokerhost.exe"]);
+  let ParentBaselines =
+      DeviceProcessEvents
+      | where TimeGenerated between (ago(BaselineWindow)..ago(LookbackWindow))
+      | where ProcessCommandLine contains "powershell" or FileName in~ ("powershell.exe","pwsh.exe")
+      | extend ParentProcess = tolower(InitiatingProcessParentFileName),
+               CommandLength = strlen(ProcessCommandLine),
+               UniqueChars = array_length(split(replace_regex(ProcessCommandLine, @"(.)", "\\1|"), "|")),
+               ApproxEntropy = todouble(UniqueChars) / todouble(CommandLength) * 10.0
+      | summarize BaselineCount = count(),
+                  AvgEntropy = avg(ApproxEntropy),
+                  MaxEntropy = max(ApproxEntropy),
+                  Frequency = count() / (BaselineWindow / 1d),
+                  CommonArgs = make_set(ProcessCommandLine, 5)
+        by ParentProcess, DeviceName;
+  let PowerShellEvents =
+      DeviceProcessEvents
+      | where TimeGenerated >= ago(LookbackWindow)
+      | where FileName in~ ("powershell.exe","pwsh.exe") or ProcessCommandLine contains "powershell"
+      | extend ParentProcess = tolower(InitiatingProcessParentFileName),
+               ParentPID = InitiatingProcessParentId,
+               ParentCommandLine = InitiatingProcessParentCommandLine,
+               PSCommandLine = ProcessCommandLine,
+               IsLegitimateParent = ParentProcess in (LegitimateParents),
+               IsSuspiciousParent = ParentProcess in (SuspiciousParents),
+               IsEvasionParent   = ParentProcess in (EvasionParents),
+               HasSuspiciousArgs = ProcessCommandLine has_any (
+                    "-enc","-EncodedCommand","-WindowStyle Hidden","-ExecutionPolicy Bypass",
+                    "-NoProfile","-NonInteractive","IEX","Invoke-Expression",
+                    "DownloadString","DownloadFile","webclient","Net.WebClient",
+                    "-Command &","FromBase64String","System.Convert","[Convert]"),
+               HasNetworkActivity = ProcessCommandLine has_any (
+                    "http://","https://","ftp://","Invoke-WebRequest","curl","wget",
+                    "Start-BitsTransfer","Net.Sockets"),
+               HasFileOperations = ProcessCommandLine has_any (
+                    "Out-File","Set-Content","Add-Content","Copy-Item","Move-Item",
+                    ">"," >>","New-Item","Remove-Item"),
+               HasRegistryOps = ProcessCommandLine has_any (
+                    "New-ItemProperty","Set-ItemProperty","Remove-ItemProperty",
+                    "HKLM:","HKCU:","Registry::");
+  let AnalyzedEvents =
+      PowerShellEvents
+      | join kind=leftouter (ParentBaselines) on ParentProcess, DeviceName
+      | extend ApproxEntropy = todouble(array_length(split(replace_regex(PSCommandLine, @"(.)","\\1|"), "|")))
+                               / todouble(strlen(PSCommandLine)) * 10.0,
+               EntropyAnomaly = ApproxEntropy > (coalesce(AvgEntropy,0) + 2.0),
+               IsRareParent   = isnull(BaselineCount) or BaselineCount < 5,
+               IsVeryRareParent = isnull(BaselineCount) or BaselineCount < 2,
+               ParentRiskScore = case(
+                    IsEvasionParent,50,
+                    IsSuspiciousParent,40,
+                    IsVeryRareParent,35,
+                    IsRareParent,25,
+                    not(IsLegitimateParent),20,
+                    10),
+               ArgumentRiskScore = case(
+                    HasSuspiciousArgs and HasNetworkActivity,40,
+                    HasSuspiciousArgs,20,
+                    HasNetworkActivity,15,
+                    EntropyAnomaly,25,
+                    5),
+               TotalRiskScore = ParentRiskScore + ArgumentRiskScore,
+               AlertSeverity = case(
+                    TotalRiskScore >= 90,"Critical",
+                    TotalRiskScore >= 70,"High",
+                    TotalRiskScore >= 45,"Medium","Low")
+      | where AlertSeverity in ("Critical","High","Medium")
+      | extend Evidence = pack(
+            "ParentProcess", ParentProcess,
+            "ParentCommandLine", ParentCommandLine,
+            "PowerShellCommand", PSCommandLine,
+            "EntropyMetrics", pack("ApproxEntropy", ApproxEntropy,
+                                   "BaselineAvgEntropy", coalesce(AvgEntropy,0),
+                                   "EntropyAnomaly", EntropyAnomaly),
+            "DetectionFlags", pack(
+                 "EvasionParent", IsEvasionParent,
+                 "SuspiciousParent", IsSuspiciousParent,
+                 "SuspiciousArgs", HasSuspiciousArgs,
+                 "NetworkActivity", HasNetworkActivity,
+                 "RareParent", IsRareParent))
+      | extend Recommendations = case(
+            AlertSeverity == "Critical",
+            "IMMEDIATE: Isolate endpoint, collect full parent/child process chain and any dropped files, decode/analyze PowerShell command, check for lateral movement and data exfiltration, investigate parent process legitimacy",
+            AlertSeverity == "High",
+            "URGENT: Decode PowerShell execution, investigate parent process context, review outbound network connections and file writes, check for persistence mechanisms, validate user activity and business justification",
+            AlertSeverity == "Medium",
+            "INVESTIGATE: Review execution context, entropy patterns, and parent process rarity. Validate business justification and tune allow-lists if legitimate automation is discovered",
+            "MONITOR: Document for baseline tuning")
+      | project TimeGenerated, DeviceName, DeviceId, AccountName, AccountDomain,
+                AlertSeverity, TotalRiskScore, ParentProcess,
+                PowerShellCommand = PSCommandLine,
+                EntropyScore = ApproxEntropy,
+                Evidence, Recommendations;
+triage:
+  - For each alert, open the `Evidence` field to review ParentProcess, ParentCommandLine,
+    PowerShellCommand, and entropy metrics.
+  - Validate whether the parent process is legitimate for that device/user.
+  - Decode and analyze the PowerShell command if suspicious or obfuscated.
+  - Check network connections, file writes, and registry changes referenced in Evidence.
+  - If severity is Critical or High, isolate the host and begin lateral-movement and data-exfiltration checks.
+  - Document findings and tune the LegitimateParents list or EntropyThreshold as needed.
+entities:
+  - account: AccountName
+  - host: DeviceName
+  - process: ParentProcess
+fields_returned:
+  - TimeGenerated
+  - DeviceName
+  - DeviceId
+  - AccountName
+  - AccountDomain
+  - AlertSeverity
+  - TotalRiskScore
+  - ParentProcess
+  - PowerShellCommand
+  - EntropyScore
+  - Evidence
+  - Recommendations
