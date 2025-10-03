@@ -1,411 +1,285 @@
-// PowerShell Parent Process Evasion Detection with Entropy Analysis
-// High-fidelity approach focusing on suspicious parent-child combinations + obfuscation
+// Combined Data Exfiltration Detection - Staging, Compression, and Cloud Transfer
+// Detects the full attack chain: Archive creation -> Cloud tool usage -> Data transfer
 
 // Parameters
 let LookbackWindow = 4h;
+let CorrelationWindow = 60m;  // Time window to correlate archive + upload
 let BaselineWindow = 14d;
-let EntropyThreshold = 4.5; // Adjust based on environment noise
+let LargeArchiveThreshold = 100MB;
+let LargeTransferThreshold = 50MB;
+let Window = toduration(CorrelationWindow);
 
-// Known legitimate parent processes (customize for your environment)
-let LegitimateParents = dynamic([
-    // System processes
-    "explorer.exe", "cmd.exe", "winlogon.exe", "services.exe", "svchost.exe",
-    "powershell.exe", "powershell_ise.exe", "pwsh.exe",
-    // Management tools
-    "mmc.exe", "servermanager.exe", "wsmprovhost.exe", "winrm.exe",
-    // Installers (common patterns)
-    "msiexec.exe", "setup.exe", "install.exe", "update.exe",
-    // Enterprise software (add your specific tools)
-    "veeam.backup.service.exe", "commvault.exe", "psexec.exe", "psexec64.exe"
+// Known cloud storage tools and their indicators
+let CloudStorageTools = dynamic([
+    // Rclone variants
+    "rclone.exe", "rclone64.exe", "rclone32.exe",
+    // Azure Storage
+    "storageexplorer.exe", "azurestorageexplorer.exe", "azcopy.exe",
+    // MEGA
+    "megasync.exe", "megacmd.exe", "megatools.exe",
+    // Other cloud sync
+    "winscp.exe", "filezilla.exe", "cyberduck.exe",
+    // Command line tools
+    "curl.exe", "wget.exe", "powershell.exe"
 ]);
 
-// Suspicious parent processes (high confidence indicators)
-let SuspiciousParents = dynamic([
-    // Browsers (should rarely spawn PowerShell directly)
-    "iexplore.exe", "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe",
-    // Office applications (macro-based attacks)
-    "winword.exe", "excel.exe", "powerpnt.exe", "msaccess.exe", "visio.exe", "project.exe",
-    // PDF readers (document-based attacks)
-    "acrord32.exe", "foxitreader.exe", "sumatra.exe",
-    // Media players (less common attack vector)
-    "wmplayer.exe", "vlc.exe", "mpc-hc64.exe",
-    // Chat/communication
-    "teams.exe", "slack.exe", "discord.exe", "zoom.exe",
-    // Uncommon system utilities
-    "regsvr32.exe", "rundll32.exe", "mshta.exe", "cscript.exe", "wscript.exe",
-    "certutil.exe", "bitsadmin.exe", "regasm.exe", "installutil.exe"
+let CloudStorageDomains = dynamic([
+    // Major cloud storage providers
+    "rclone.org", "mega.nz", "mega.io", "megasync.net",
+    "dropbox.com", "box.com", "onedrive.live.com", 
+    "drive.google.com", "s3.amazonaws.com", "blob.core.windows.net",
+    "backblaze.com", "wasabi.com", "digitalocean.com",
+    // Personal/free storage
+    "mediafire.com", "4shared.com", "filemail.com", "wetransfer.com",
+    "sendspace.com", "zippyshare.com"
 ]);
 
-// Evasion-related parent processes (living off the land binaries)
-let EvasionParents = dynamic([
-    "rundll32.exe", "regsvr32.exe", "mshta.exe", "wmic.exe",
-    "certutil.exe", "bitsadmin.exe", "forfiles.exe", "pcalua.exe",
-    "regasm.exe", "regsvcs.exe", "installutil.exe", "msxsl.exe",
-    "sqltoolsps.exe", "sqlps.exe", "brokerhost.exe"
+// Archive/compression tools
+let ArchiveTools = dynamic([
+    "7z.exe", "7za.exe", "7zg.exe", "7zfm.exe",
+    "winrar.exe", "rar.exe", "unrar.exe",
+    "zip.exe", "gzip.exe", "tar.exe",
+    "powershell.exe", "cmd.exe"  // Can create archives
 ]);
 
-// Get baseline PowerShell parent patterns with entropy analysis
-let ParentBaselines = 
-    DeviceProcessEvents
-    | where TimeGenerated between (ago(BaselineWindow) .. ago(LookbackWindow))
-    | where ProcessCommandLine contains "powershell" 
-        or FileName in~ ("powershell.exe", "pwsh.exe")
-    | extend 
-        ParentProcess = tolower(InitiatingProcessParentFileName),
-        // Calculate entropy using character frequency analysis
-        CommandLength = strlen(ProcessCommandLine),
-        UniqueChars = array_length(split(replace_regex(ProcessCommandLine, @"(.)", "\\1|"), "|"))
-    | extend 
-        // Simplified entropy approximation: unique chars / total length
-        ApproxEntropy = todouble(UniqueChars) / todouble(CommandLength) * 10.0
-    | summarize 
-        BaselineCount = count(),
-        AvgEntropy = avg(ApproxEntropy),
-        MaxEntropy = max(ApproxEntropy),
-        Frequency = count() / (BaselineWindow / 1d),
-        CommonArgs = make_set(ProcessCommandLine, 5)
-    by ParentProcess, DeviceName;
+let ArchiveExtensions = dynamic([
+    ".7z", ".zip", ".rar", ".tar", ".gz", ".bz2", 
+    ".xz", ".tar.gz", ".tgz", ".tar.bz2"
+]);
 
-// Current PowerShell executions
-let PowerShellEvents = DeviceProcessEvents
+// Suspicious staging locations
+let StagingLocations = dynamic([
+    "\\temp\\", "\\tmp\\", "\\public\\", "\\users\\public\\",
+    "\\programdata\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\",
+    "c:\\temp\\", "c:\\tmp\\", "c:\\users\\public\\"
+]);
+
+// Legitimate backup/enterprise tools (for exclusions)
+let LegitimateBackupTools = dynamic([
+    "veeam", "commvault", "backup", "acronis", "veritas",
+    "windows backup", "system restore", "windows server backup"
+]);
+
+// Module 1: Cloud Storage Tool Activity
+let CloudToolActivity = DeviceProcessEvents
 | where TimeGenerated >= ago(LookbackWindow)
-| where FileName in~ ("powershell.exe", "pwsh.exe") 
-    or ProcessCommandLine contains "powershell"
-| extend 
-    ParentProcess = tolower(InitiatingProcessParentFileName),
-    ParentPID = InitiatingProcessParentId,
-    ParentCommandLine = InitiatingProcessParentCommandLine,
-    PSCommandLine = ProcessCommandLine,
-    // Classification flags
-    IsLegitimateParent = ParentProcess in (LegitimateParents),
-    IsSuspiciousParent = ParentProcess in (SuspiciousParents), 
-    IsEvasionParent = ParentProcess in (EvasionParents),
-    // Command line analysis
-    HasSuspiciousArgs = ProcessCommandLine has_any (
-        "-enc", "-EncodedCommand", "-WindowStyle Hidden", "-ExecutionPolicy Bypass",
-        "-NoProfile", "-NonInteractive", "IEX", "Invoke-Expression", 
-        "DownloadString", "DownloadFile", "webclient", "Net.WebClient",
-        "-Command &", "FromBase64String", "System.Convert", "[Convert]"
-    ),
-    HasNetworkActivity = ProcessCommandLine has_any (
-        "http://", "https://", "ftp://", "Invoke-WebRequest", "curl", 
-        "wget", "Start-BitsTransfer", "Net.Sockets"
-    ),
-    HasFileOperations = ProcessCommandLine has_any (
-        "Out-File", "Set-Content", "Add-Content", "Copy-Item", "Move-Item",
-        ">", ">>", "New-Item", "Remove-Item"
-    ),
-    HasRegistryOps = ProcessCommandLine has_any (
-        "New-ItemProperty", "Set-ItemProperty", "Remove-ItemProperty",
-        "HKLM:", "HKCU:", "Registry::"
-    ),
-    IsShortLived = ProcessCommandLine contains "-Command" and 
-        (strlen(ProcessCommandLine) > 200 or ProcessCommandLine contains ";")
-| project TimeGenerated, DeviceName, DeviceId, FileName, ProcessCommandLine,
-          ParentProcess, ParentPID, ParentCommandLine, AccountName, AccountDomain,
-          IsLegitimateParent, IsSuspiciousParent, IsEvasionParent,
-          HasSuspiciousArgs, HasNetworkActivity, HasFileOperations, 
-          HasRegistryOps, IsShortLived;
-
-// Correlation with baselines and enhanced scoring
-let AnalyzedEvents = PowerShellEvents
-| join kind=leftouter (ParentBaselines) on ParentProcess, DeviceName
+| where FileName in~ (CloudStorageTools)
+    or ProcessCommandLine has_any (CloudStorageTools)
+    or ProcessCommandLine has_any ("rclone", "azcopy", "megasync")
 | extend
-    // Baseline comparison for entropy
-    EntropyAnomaly = ApproxEntropy > (AvgEntropy + 2.0), // 2 standard deviations above normal
-    IsVeryHighEntropy = ApproxEntropy > (EntropyThreshold + 1.0),
-    
-    // Rarity scoring
-    IsRareParent = isnull(BaselineCount) or BaselineCount < 5,
-    IsVeryRareParent = isnull(BaselineCount) or BaselineCount < 2,
-    
-    // Enhanced risk scoring with entropy weight
-    ParentRiskScore = case(
-        IsEvasionParent, 50,           // LOLBAS parents (highest risk)
-        IsSuspiciousParent, 40,        // Browsers, Office apps
-        IsVeryRareParent, 35,          // Never/rarely seen parent
-        IsRareParent, 25,              // Infrequently seen parent
-        not(IsLegitimateParent), 20,   // Not in known good list
-        10                             // Baseline legitimate
+    IsRclone = FileName =~ "rclone.exe" or ProcessCommandLine contains "rclone",
+    IsAzureStorage = FileName contains "storage" or ProcessCommandLine contains "azcopy",
+    IsMega = FileName contains "mega" or ProcessCommandLine contains "mega",
+    HasConfigFlag = ProcessCommandLine has_any ("--config", "config", "/config"),
+    HasSyncFlag = ProcessCommandLine has_any ("sync", "copy", "move", "upload"),
+    IsFromUnusualPath = not(FolderPath has_any ("\\program files\\", "\\program files (x86)\\"))
+| project TimeGenerated, DeviceName, DeviceId, 
+          ToolFileName = FileName, ToolCommandLine = ProcessCommandLine,
+          ToolFolderPath = FolderPath, ToolAccountName = InitiatingProcessAccountName,
+          IsRclone, IsAzureStorage, IsMega, HasConfigFlag, HasSyncFlag, IsFromUnusualPath;
+
+// Module 2: Archive Creation Activity  
+let ArchiveActivity = DeviceFileEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ActionType == "FileCreated"
+| where FileName endswith_cs ".7z" or FileName endswith_cs ".zip" or FileName endswith_cs ".rar"
+    or FileName endswith_cs ".tar" or FileName endswith_cs ".tar.gz" or FileName endswith_cs ".tgz"
+| extend
+    FileSize = tolong(FileSize),
+    FileSizeMB = tolong(FileSize) / 1048576,
+    IsLargeArchive = tolong(FileSize) > (LargeArchiveThreshold * 1048576),
+    IsInStagingLocation = FolderPath has_any (StagingLocations),
+    IsInUserProfile = FolderPath contains "\\users\\" and not(FolderPath contains "\\appdata\\"),
+    FileExtension = tolower(extract(@"(\.[^.]+)$", 1, FileName))
+| where FileSizeMB > 10  // Filter small archives (likely legitimate)
+| project TimeGenerated, DeviceName, DeviceId,
+          ArchiveFileName = FileName, ArchivePath = FolderPath,
+          FileSizeMB, IsLargeArchive, IsInStagingLocation, IsInUserProfile,
+          ArchiveCreator = InitiatingProcessAccountName, FileExtension;
+
+// Module 3: Archive Tool Execution (for context)
+let ArchiveToolExecution = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where FileName in~ (ArchiveTools)
+    or ProcessCommandLine has_any (ArchiveTools)
+| where ProcessCommandLine has_any ("a ", "archive", "compress", "-r", "/r") // Archive creation flags
+| extend
+    Is7Zip = FileName contains "7z",
+    IsWinRAR = FileName contains "rar",
+    IsRecursive = ProcessCommandLine has_any ("-r", "/r", "--recursive"),
+    HasPasswordFlag = ProcessCommandLine has_any ("-p", "/p", "--password"),
+    TargetPath = extract(@"(?:a|archive)\s+(?:""([^""]+)""|(\S+))", 1, ProcessCommandLine)
+| project TimeGenerated, DeviceName, DeviceId,
+          ArchiveToolName = FileName, ArchiveToolCommand = ProcessCommandLine,
+          Is7Zip, IsWinRAR, IsRecursive, HasPasswordFlag, TargetPath,
+          ToolAccountName = InitiatingProcessAccountName;
+
+// Module 4: Network Connections to Cloud Storage
+let CloudNetworkActivity = DeviceNetworkEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (CloudStorageDomains)
+    or RemoteIPType == "Public" and RemotePort in (443, 80, 21, 22, 990, 989)
+| extend
+    IsKnownCloudDomain = RemoteUrl has_any (CloudStorageDomains),
+    BytesSentMB = tolong(SentBytes) / 1048576,
+    IsLargeTransfer = tolong(SentBytes) > (LargeTransferThreshold * 1048576)
+| where BytesSentMB > 1  // Filter noise
+| project TimeGenerated, DeviceName, DeviceId,
+          InitiatingProcessFileName, RemoteUrl, RemoteIP, RemotePort,
+          BytesSentMB, IsLargeTransfer, IsKnownCloudDomain,
+          NetworkAccountName = InitiatingProcessAccountName;
+
+// Correlation Logic: Combine all indicators
+
+// Correlation 1: Archive creation followed by cloud tool activity
+let Archive_Then_CloudTool = ArchiveActivity
+| join kind=inner (CloudToolActivity) on DeviceName, DeviceId
+| where CloudToolActivity.TimeGenerated between (ArchiveActivity.TimeGenerated .. (ArchiveActivity.TimeGenerated + Window))
+| extend 
+    Signal = "Archive_Then_CloudTool",
+    TimeDelta = datetime_diff('minute', CloudToolActivity.TimeGenerated, ArchiveActivity.TimeGenerated),
+    Evidence = pack(
+        "ArchiveFile", ArchiveFileName,
+        "ArchiveSizeMB", FileSizeMB,
+        "CloudTool", ToolFileName,
+        "TimeBetween", TimeDelta
+    );
+
+// Correlation 2: Archive creation followed by large network transfer
+let Archive_Then_Transfer = ArchiveActivity
+| join kind=inner (CloudNetworkActivity) on DeviceName, DeviceId
+| where CloudNetworkActivity.TimeGenerated between (ArchiveActivity.TimeGenerated .. (ArchiveActivity.TimeGenerated + Window))
+| extend
+    Signal = "Archive_Then_Transfer",
+    TimeDelta = datetime_diff('minute', CloudNetworkActivity.TimeGenerated, ArchiveActivity.TimeGenerated),
+    Evidence = pack(
+        "ArchiveFile", ArchiveFileName,
+        "ArchiveSizeMB", FileSizeMB,
+        "TransferDestination", RemoteUrl,
+        "TransferSizeMB", BytesSentMB,
+        "TimeBetween", TimeDelta
+    );
+
+// Correlation 3: Cloud tool activity with large transfers
+let CloudTool_With_Transfer = CloudToolActivity
+| join kind=inner (CloudNetworkActivity) on DeviceName, DeviceId
+| where abs(datetime_diff('minute', CloudNetworkActivity.TimeGenerated, CloudToolActivity.TimeGenerated)) <= 5
+| extend
+    Signal = "CloudTool_With_Transfer",
+    Evidence = pack(
+        "CloudTool", ToolFileName,
+        "Destination", RemoteUrl,
+        "TransferSizeMB", BytesSentMB
+    );
+
+// Correlation 4: Archive tool execution followed by cloud activity
+let ArchiveTool_Then_Cloud = ArchiveToolExecution
+| join kind=inner (CloudToolActivity) on DeviceName, DeviceId  
+| where CloudToolActivity.TimeGenerated between (ArchiveToolExecution.TimeGenerated .. (ArchiveToolExecution.TimeGenerated + Window))
+| extend
+    Signal = "ArchiveTool_Then_Cloud",
+    TimeDelta = datetime_diff('minute', CloudToolActivity.TimeGenerated, ArchiveToolExecution.TimeGenerated),
+    Evidence = pack(
+        "ArchiveTool", ArchiveToolName,
+        "CloudTool", ToolFileName,
+        "TimeBetween", TimeDelta
+    );
+
+// Combine all correlations
+let AllCorrelations = union isfuzzy=true 
+    Archive_Then_CloudTool,
+    Archive_Then_Transfer,
+    CloudTool_With_Transfer,
+    ArchiveTool_Then_Cloud
+| extend
+    User = coalesce(ArchiveCreator, ToolAccountName, NetworkAccountName),
+    Device = DeviceName,
+    SignalName = Signal;
+
+// Score and aggregate by device/user
+AllCorrelations
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    Signals = make_list(pack(
+        "Signal", SignalName,
+        "Time", TimeGenerated,
+        "Evidence", Evidence
+    )),
+    SignalCount = count(),
+    UniqueSignals = dcount(SignalName),
+    ArchiveSizes = make_list(FileSizeMB),
+    CloudTools = make_set(ToolFileName),
+    Destinations = make_set(RemoteUrl)
+by Device, User
+| extend
+    // Calculate risk score
+    BaseScore = case(
+        UniqueSignals >= 3, 60,  // Multiple correlation types
+        UniqueSignals == 2, 45,  // Two correlation types
+        UniqueSignals == 1, 30,  // Single correlation type
+        10
     ),
     
-    // Argument risk scoring with heavy entropy weighting
-    ArgumentRiskScore = case(
-        (IsEncodedCommand or IsLikelyBase64) and IsVeryHighEntropy and HasNetworkActivity, 60, // Encoded + high entropy + network
-        (IsEncodedCommand or IsLikelyBase64) and IsHighEntropy, 50, // Encoded + high entropy
-        IsVeryHighEntropy and HasNetworkActivity, 45,              // Very high entropy + network
-        IsEncodedCommand or IsLikelyBase64, 40,                    // Base64 encoding detected
-        IsHighEntropy and HasSuspiciousArgs, 35,                   // High entropy + suspicious args
-        EntropyAnomaly and HasObfuscation, 30,                     // Entropy anomaly + obfuscation
-        IsHighEntropy, 25,                                         // High entropy alone
-        HasSuspiciousArgs and HasNetworkActivity, 20,              // Suspicious args + network
-        HasSuspiciousArgs and HasObfuscation, 18,                  // Suspicious args + obfuscation
-        HasNetworkActivity, 15,                                    // Network activity
-        HasSuspiciousArgs, 12,                                     // Suspicious arguments
-        HasObfuscation, 10,                                        // Obfuscation techniques
-        5                                                          // Standard execution
+    // Bonus factors
+    VolumeBonus = case(
+        array_length(ArchiveSizes) > 0 and ArchiveSizes[0] > 500, 20,  // Very large archives
+        array_length(ArchiveSizes) > 0 and ArchiveSizes[0] > 200, 10,  // Large archives
+        0
     ),
     
-    TotalRiskScore = ParentRiskScore + ArgumentRiskScore
+    ToolBonus = case(
+        array_length(CloudTools) > 1, 15,  // Multiple cloud tools
+        CloudTools has "rclone", 10,        // Rclone specifically
+        CloudTools has "azcopy", 10,        // Azure Storage tools
+        5
+    ),
+    
+    TotalRiskScore = BaseScore + VolumeBonus + ToolBonus
 
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 90, "Critical",
-        TotalRiskScore >= 70, "High",
-        TotalRiskScore >= 45, "Medium", 
+        TotalRiskScore >= 80, "Critical",
+        TotalRiskScore >= 60, "High",
+        TotalRiskScore >= 40, "Medium",
         "Low"
-    );
-
-// High-fidelity filtering and final output with enhanced evidence
-AnalyzedEvents
-| where AlertSeverity in ("Critical", "High", "Medium")
-| extend
-    Evidence = pack(
-        "ParentProcess", ParentProcess,
-        "ParentCommandLine", ParentCommandLine,
-        "PowerShellCommand", PSCommandLine,
-        "EntropyMetrics", pack(
-            "ApproxEntropy", ApproxEntropy,
-            "BaselineAvgEntropy", iif(isnull(AvgEntropy), 0.0, AvgEntropy),
-            "IsHighEntropy", IsHighEntropy,
-            "EntropyAnomaly", EntropyAnomaly
-        ),
-        "BaselineFrequency", iif(isnull(Frequency), 0.0, Frequency),
-        "DetectionFlags", pack(
-            "EvasionParent", IsEvasionParent,
-            "SuspiciousParent", IsSuspiciousParent,
-            "EncodedCommand", IsEncodedCommand,
-            "LikelyBase64", IsLikelyBase64,
-            "SuspiciousArgs", HasSuspiciousArgs,
-            "NetworkActivity", HasNetworkActivity,
-            "ObfuscationTechniques", HasObfuscation,
-            "RareParent", IsRareParent
-        )
+    ),
+    
+    ActivitySummary = pack(
+        "SignalCount", SignalCount,
+        "UniqueSignalTypes", UniqueSignals,
+        "CloudTools", CloudTools,
+        "Destinations", Destinations,
+        "Duration", datetime_diff('minute', LastSeen, FirstSeen)
     ),
     
     Recommendations = case(
         AlertSeverity == "Critical",
-        "IMMEDIATE: Isolate endpoint, decode/analyze PowerShell command, check for lateral movement and data exfiltration, investigate parent process legitimacy",
-        AlertSeverity == "High", 
-        "URGENT: Decode PowerShell execution, investigate parent process context, check for persistence mechanisms, validate user activity and business justification",
+        "IMMEDIATE: Isolate device, block cloud storage domains, analyze archives for sensitive data, revoke user credentials, check for lateral movement",
+        AlertSeverity == "High",
+        "URGENT: Investigate archive contents, validate cloud tool legitimacy, check user authorization for data access, review network logs for full transfer scope",
         AlertSeverity == "Medium",
-        "INVESTIGATE: Review execution context and entropy patterns, validate business justification, check for similar obfuscation patterns across environment",
+        "INVESTIGATE: Verify business justification, confirm authorized backup/sync activity, review user data access patterns",
         "MONITOR: Document for baseline tuning"
     ),
     
-    // Enhanced MITRE ATT&CK techniques based on detection flags
-    DetectedTechniques = strcat_array(
-        iff(IsEvasionParent, dynamic(["T1218 (Signed Binary Proxy Execution)"]), dynamic([])),
-        iff(IsEncodedCommand or IsLikelyBase64 or IsHighEntropy, dynamic(["T1027 (Obfuscated Files or Information)"]), dynamic([])),
-        iff(HasObfuscation, dynamic(["T1027.010 (Command Obfuscation)"]), dynamic([])),
-        iff(HasNetworkActivity, dynamic(["T1105 (Ingress Tool Transfer)"]), dynamic([])),
-        dynamic(["T1059.001 (Command and Scripting Interpreter: PowerShell)"])
-    , ", ")
+    DetectedTechniques = "T1560.001 (Archive via Utility), T1567.002 (Exfiltration to Cloud Storage), T1041 (Exfiltration Over C2 Channel)"
 
+| where AlertSeverity in ("Critical", "High", "Medium")
 | project
-    TimeGenerated,
-    DeviceName, 
-    DeviceId,
-    AccountName,
-    AccountDomain,
+    TimeGenerated = LastSeen,
+    DeviceName = Device,
+    UserPrincipalName = User,
     AlertSeverity,
     TotalRiskScore,
-    ParentProcess,
-    PowerShellCommand = PSCommandLine,
-    EntropyScore = ApproxEntropy,
-    Evidence,
+    ActivityWindowMinutes = datetime_diff('minute', LastSeen, FirstSeen),
+    SignalCount,
+    UniqueSignalTypes = UniqueSignals,
+    CloudToolsUsed = CloudTools,
+    ExfiltrationDestinations = Destinations,
+    Signals,
+    ActivitySummary,
     DetectedTechniques,
     Recommendations
-
-| sort by TotalRiskScore desc, TimeGenerated desc
-
-// Additional query for parent process anomaly detection
-// (Run separately for environment assessment)
-/*
-DeviceProcessEvents
-| where TimeGenerated >= ago(7d)
-| where FileName in~ ("powershell.exe", "pwsh.exe")
-| summarize 
-    ExecutionCount = count(),
-    UniqueDevices = dcount(DeviceName),
-    SampleCommands = make_set(ProcessCommandLine, 5)
-by ParentProcess = tolower(InitiatingProcessParentFileName)
-| where ExecutionCount > 0
-| sort by ExecutionCount asc
-| extend Rarity = case(ExecutionCount <= 5, "Very Rare", ExecutionCount <= 20, "Rare", ExecutionCount <= 100, "Uncommon", "Common")
-*/
-
-
-
-
-////////
-
-
-
-
-id: powershell_parent_entropy_detection
-name: PowerShell Parent Process Evasion with Entropy Analysis
-description: >
-  Detects suspicious PowerShell executions launched from unusual or high-risk parent processes,
-  combined with obfuscated or high-entropy command lines. Uses a 14-day baseline to score rarity,
-  parent legitimacy, argument risk factors, and entropy anomalies. Produces a single TotalRiskScore
-  and AlertSeverity for simplified triage.
-severity: High
-status: Experimental
-author: Your Team
-date: 2025-09-17
-tags:
-  - powershell
-  - lolbas
-  - obfuscation
-  - entropy
-  - correlation
-mitre_attack:
-  - technique: T1059.001     # Command and Scripting Interpreter: PowerShell
-  - technique: T1027         # Obfuscated Files or Information
-  - subtechnique: T1027.010  # Obfuscated Files or Information: Command Obfuscation
-  - technique: T1105         # Ingress Tool Transfer
-  - technique: T1218         # Signed Binary Proxy Execution (LOLBAS parents)
-datasource:
-  - Microsoft Defender for Endpoint
-  - Microsoft 365 Defender
-platform:
-  - Windows
-query: |
-  // High-fidelity PowerShell Parent-Process Evasion Detection with Entropy Analysis
-  // ----------------------------------------------
-  let LookbackWindow = 4h;
-  let BaselineWindow = 14d;
-  let EntropyThreshold = 4.5;
-  let LegitimateParents = dynamic(["explorer.exe","cmd.exe","winlogon.exe","services.exe","svchost.exe",
-                                   "powershell.exe","powershell_ise.exe","pwsh.exe",
-                                   "mmc.exe","servermanager.exe","wsmprovhost.exe","winrm.exe",
-                                   "msiexec.exe","setup.exe","install.exe","update.exe",
-                                   "veeam.backup.service.exe","commvault.exe","psexec.exe","psexec64.exe"]);
-  let SuspiciousParents = dynamic(["iexplore.exe","chrome.exe","msedge.exe","firefox.exe","opera.exe",
-                                   "winword.exe","excel.exe","powerpnt.exe","msaccess.exe","visio.exe","project.exe",
-                                   "acrord32.exe","foxitreader.exe","sumatra.exe",
-                                   "wmplayer.exe","vlc.exe","mpc-hc64.exe",
-                                   "teams.exe","slack.exe","discord.exe","zoom.exe",
-                                   "regsvr32.exe","rundll32.exe","mshta.exe","cscript.exe","wscript.exe",
-                                   "certutil.exe","bitsadmin.exe","regasm.exe","installutil.exe"]);
-  let EvasionParents = dynamic(["rundll32.exe","regsvr32.exe","mshta.exe","wmic.exe","certutil.exe","bitsadmin.exe",
-                                "forfiles.exe","pcalua.exe","regasm.exe","regsvcs.exe","installutil.exe",
-                                "msxsl.exe","sqltoolsps.exe","sqlps.exe","brokerhost.exe"]);
-  let ParentBaselines =
-      DeviceProcessEvents
-      | where TimeGenerated between (ago(BaselineWindow)..ago(LookbackWindow))
-      | where ProcessCommandLine contains "powershell" or FileName in~ ("powershell.exe","pwsh.exe")
-      | extend ParentProcess = tolower(InitiatingProcessParentFileName),
-               CommandLength = strlen(ProcessCommandLine),
-               UniqueChars = array_length(split(replace_regex(ProcessCommandLine, @"(.)", "\\1|"), "|")),
-               ApproxEntropy = todouble(UniqueChars) / todouble(CommandLength) * 10.0
-      | summarize BaselineCount = count(),
-                  AvgEntropy = avg(ApproxEntropy),
-                  MaxEntropy = max(ApproxEntropy),
-                  Frequency = count() / (BaselineWindow / 1d),
-                  CommonArgs = make_set(ProcessCommandLine, 5)
-        by ParentProcess, DeviceName;
-  let PowerShellEvents =
-      DeviceProcessEvents
-      | where TimeGenerated >= ago(LookbackWindow)
-      | where FileName in~ ("powershell.exe","pwsh.exe") or ProcessCommandLine contains "powershell"
-      | extend ParentProcess = tolower(InitiatingProcessParentFileName),
-               ParentPID = InitiatingProcessParentId,
-               ParentCommandLine = InitiatingProcessParentCommandLine,
-               PSCommandLine = ProcessCommandLine,
-               IsLegitimateParent = ParentProcess in (LegitimateParents),
-               IsSuspiciousParent = ParentProcess in (SuspiciousParents),
-               IsEvasionParent   = ParentProcess in (EvasionParents),
-               HasSuspiciousArgs = ProcessCommandLine has_any (
-                    "-enc","-EncodedCommand","-WindowStyle Hidden","-ExecutionPolicy Bypass",
-                    "-NoProfile","-NonInteractive","IEX","Invoke-Expression",
-                    "DownloadString","DownloadFile","webclient","Net.WebClient",
-                    "-Command &","FromBase64String","System.Convert","[Convert]"),
-               HasNetworkActivity = ProcessCommandLine has_any (
-                    "http://","https://","ftp://","Invoke-WebRequest","curl","wget",
-                    "Start-BitsTransfer","Net.Sockets"),
-               HasFileOperations = ProcessCommandLine has_any (
-                    "Out-File","Set-Content","Add-Content","Copy-Item","Move-Item",
-                    ">"," >>","New-Item","Remove-Item"),
-               HasRegistryOps = ProcessCommandLine has_any (
-                    "New-ItemProperty","Set-ItemProperty","Remove-ItemProperty",
-                    "HKLM:","HKCU:","Registry::");
-  let AnalyzedEvents =
-      PowerShellEvents
-      | join kind=leftouter (ParentBaselines) on ParentProcess, DeviceName
-      | extend ApproxEntropy = todouble(array_length(split(replace_regex(PSCommandLine, @"(.)","\\1|"), "|")))
-                               / todouble(strlen(PSCommandLine)) * 10.0,
-               EntropyAnomaly = ApproxEntropy > (coalesce(AvgEntropy,0) + 2.0),
-               IsRareParent   = isnull(BaselineCount) or BaselineCount < 5,
-               IsVeryRareParent = isnull(BaselineCount) or BaselineCount < 2,
-               ParentRiskScore = case(
-                    IsEvasionParent,50,
-                    IsSuspiciousParent,40,
-                    IsVeryRareParent,35,
-                    IsRareParent,25,
-                    not(IsLegitimateParent),20,
-                    10),
-               ArgumentRiskScore = case(
-                    HasSuspiciousArgs and HasNetworkActivity,40,
-                    HasSuspiciousArgs,20,
-                    HasNetworkActivity,15,
-                    EntropyAnomaly,25,
-                    5),
-               TotalRiskScore = ParentRiskScore + ArgumentRiskScore,
-               AlertSeverity = case(
-                    TotalRiskScore >= 90,"Critical",
-                    TotalRiskScore >= 70,"High",
-                    TotalRiskScore >= 45,"Medium","Low")
-      | where AlertSeverity in ("Critical","High","Medium")
-      | extend Evidence = pack(
-            "ParentProcess", ParentProcess,
-            "ParentCommandLine", ParentCommandLine,
-            "PowerShellCommand", PSCommandLine,
-            "EntropyMetrics", pack("ApproxEntropy", ApproxEntropy,
-                                   "BaselineAvgEntropy", coalesce(AvgEntropy,0),
-                                   "EntropyAnomaly", EntropyAnomaly),
-            "DetectionFlags", pack(
-                 "EvasionParent", IsEvasionParent,
-                 "SuspiciousParent", IsSuspiciousParent,
-                 "SuspiciousArgs", HasSuspiciousArgs,
-                 "NetworkActivity", HasNetworkActivity,
-                 "RareParent", IsRareParent))
-      | extend Recommendations = case(
-            AlertSeverity == "Critical",
-            "IMMEDIATE: Isolate endpoint, collect full parent/child process chain and any dropped files, decode/analyze PowerShell command, check for lateral movement and data exfiltration, investigate parent process legitimacy",
-            AlertSeverity == "High",
-            "URGENT: Decode PowerShell execution, investigate parent process context, review outbound network connections and file writes, check for persistence mechanisms, validate user activity and business justification",
-            AlertSeverity == "Medium",
-            "INVESTIGATE: Review execution context, entropy patterns, and parent process rarity. Validate business justification and tune allow-lists if legitimate automation is discovered",
-            "MONITOR: Document for baseline tuning")
-      | project TimeGenerated, DeviceName, DeviceId, AccountName, AccountDomain,
-                AlertSeverity, TotalRiskScore, ParentProcess,
-                PowerShellCommand = PSCommandLine,
-                EntropyScore = ApproxEntropy,
-                Evidence, Recommendations;
-triage:
-  - For each alert, open the `Evidence` field to review ParentProcess, ParentCommandLine,
-    PowerShellCommand, and entropy metrics.
-  - Validate whether the parent process is legitimate for that device/user.
-  - Decode and analyze the PowerShell command if suspicious or obfuscated.
-  - Check network connections, file writes, and registry changes referenced in Evidence.
-  - If severity is Critical or High, isolate the host and begin lateral-movement and data-exfiltration checks.
-  - Document findings and tune the LegitimateParents list or EntropyThreshold as needed.
-entities:
-  - account: AccountName
-  - host: DeviceName
-  - process: ParentProcess
-fields_returned:
-  - TimeGenerated
-  - DeviceName
-  - DeviceId
-  - AccountName
-  - AccountDomain
-  - AlertSeverity
-  - TotalRiskScore
-  - ParentProcess
-  - PowerShellCommand
-  - EntropyScore
-  - Evidence
-  - Recommendations
+| sort by TotalRiskScore desc, TimeGenerated d
