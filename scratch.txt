@@ -1,3 +1,38 @@
+id: exfil-correlation-archive-cloud-001
+title: Combined Data Exfiltration — Archive → Cloud Tool → Network Transfer
+description: |
+  Correlates staged archive creation, archive tool execution, cloud storage tool usage, and
+  outbound transfers to cloud storage domains to detect data exfiltration activity. This rule
+  looks for multi-signal chains (archive created -> cloud upload tool -> large network transfer)
+  within a correlation window and scores by number of correlation types, archive size, and tool type.
+  Designed as a high-fidelity correlation detection; tune allow-lists and size thresholds per environment.
+severity: High
+status: experimental
+author: Detection Engineering Team
+date: 2025-09-17
+tags:
+  - exfiltration
+  - cloud-storage
+  - archive
+  - rclone
+  - azcopy
+mitre_attack:
+  - T1560.001   # Archive via Utility
+  - T1567.002   # Exfiltration to Cloud Storage
+  - T1041       # Exfiltration Over C2 Channel (network exfiltration)
+datasource:
+  - DeviceFileEvents
+  - DeviceProcessEvents
+  - DeviceNetworkEvents
+platform:
+  - Windows
+  - Linux (where DeviceProcessEvents exist)
+
+time_window: 4h
+frequency: 15m
+trigger: results > 0
+query: |
+
 // Combined Data Exfiltration Detection - Staging, Compression, and Cloud Transfer
 // Detects the full attack chain: Archive creation -> Cloud tool usage -> Data transfer
 
@@ -54,7 +89,7 @@ let StagingLocations = dynamic([
     "c:\\temp\\", "c:\\tmp\\", "c:\\users\\public\\"
 ]);
 
-// Legitimate backup/enterprise tools (for exclusions)
+// Legitimate backup/enterprise tools (for exclusions) - this is generated but not currently used.  Can be added if editing/filtering is needed.
 let LegitimateBackupTools = dynamic([
     "veeam", "commvault", "backup", "acronis", "veritas",
     "windows backup", "system restore", "windows server backup"
@@ -282,4 +317,62 @@ by Device, User
     ActivitySummary,
     DetectedTechniques,
     Recommendations
-| sort by TotalRiskScore desc, TimeGenerated d
+| sort by TotalRiskScore desc, TimeGenerated desc
+
+
+
+entities:
+  - account:
+      field: UserPrincipalName
+  - host:
+      field: DeviceName
+  - process:
+      field: CloudToolsUsed
+
+fields_returned:
+  - TimeGenerated
+  - DeviceName
+  - UserPrincipalName
+  - AlertSeverity
+  - TotalRiskScore
+  - ActivityWindowMinutes
+  - SignalCount
+  - UniqueSignalTypes
+  - CloudToolsUsed
+  - ExfiltrationDestinations
+  - Signals
+  - Evidence
+  - ActivitySummary
+  - DetectedTechniques
+  - Recommendations
+
+triage: |
+  1. Review Severity & Summary:
+     - Use AlertSeverity and TotalRiskScore to prioritize (Critical first).
+     - Expand ActivitySummary to see SignalCount, UniqueSignalTypes, CloudTools, Destinations.
+
+  2. Validate Artifacts:
+     - Review Signals and Evidence: archive filenames, archive sizes, cloud tool command lines, and network destinations.
+     - Confirm whether the archive creator and cloud tool account are legitimate (user/automation).
+
+  3. Enrichment:
+     - Lookup Destination IPs / domains in threat intel and proxy logs.
+     - Check host endpoint telemetry for process tree, spawned tools, newly created files, persistence, or scheduled tasks.
+     - Check SIEM/full-packet logs for additional transfer context (timestamps, bytes transferred).
+
+  4. Containment & Remediation (if confirmed malicious or high-confidence):
+     - Isolate the device from the network.
+     - Block or sinkhole exfil destinations at network/proxy level.
+     - Revoke or rotate credentials for implicated accounts and service principals.
+     - Collect full archive(s) for DLP/classification and forensic review.
+     - Hunt for lateral movement from the same account or device.
+
+  5. Validation & Tuning:
+     - If benign (backup/sync), add legitimate cloud tools/domains or backup products to allow-lists.
+     - Tune thresholds (LargeArchiveThreshold, LargeTransferThreshold, time window) to reduce false positives.
+     - Document findings and update incident tickets and playbooks.
+
+references:
+  - https://attack.mitre.org/techniques/T1560/ (Archive Collected Data)
+  - https://attack.mitre.org/techniques/T1567/ (Exfiltration to Cloud Storage)
+  - https://learn.microsoft.com/azure/active-directory/ (tuning & investigation guidance)
