@@ -1,378 +1,420 @@
-id: exfil-correlation-archive-cloud-001
-title: Combined Data Exfiltration — Archive → Cloud Tool → Network Transfer
+# DE-HY25.07 Remote Service-Based Lateral Movement Detection
+id: DE-HY25.07
+title: Remote Service-Based Lateral Movement Detection
 description: |
-  Correlates staged archive creation, archive tool execution, cloud storage tool usage, and
-  outbound transfers to cloud storage domains to detect data exfiltration activity. This rule
-  looks for multi-signal chains (archive created -> cloud upload tool -> large network transfer)
-  within a correlation window and scores by number of correlation types, archive size, and tool type.
-  Designed as a high-fidelity correlation detection; tune allow-lists and size thresholds per environment.
+  Detects confirmed lateral movement by correlating remote service creation (e.g., PsExec, NetExec) on a target host with immediate command execution.
 severity: High
-status: experimental
-author: Detection Engineering Team
-date: 2025-09-17
+status: draft
+author: \m/
+date_created: 2025-10-16
+date_modified: 2025-10-16
 tags:
-  - exfiltration
-  - cloud-storage
-  - archive
-  - rclone
-  - azcopy
-mitre_attack:
-  - T1560.001   # Archive via Utility
-  - T1567.002   # Exfiltration to Cloud Storage
-  - T1041       # Exfiltration Over C2 Channel (network exfiltration)
-datasource:
-  - DeviceFileEvents
-  - DeviceProcessEvents
-  - DeviceNetworkEvents
-platform:
-  - Windows
-  - Linux (where DeviceProcessEvents exist)
+  - clarifi_path: Endpoint/Windows/Lateral_Movement
+  - tactic: Lateral Movement
+  - tactic: Execution
+  - technique: Remote Services: SMB/Windows Admin Shares
+  - technique: Create or Modify System Process: Windows Service
+  - ATT&CK_ID: T1021.002 # Remote Services: SMB/Windows Admin Shares
+  - ATT&CK_ID: T1543.003 # Create or Modify System Process: Windows Service
+  - method: Correlation/Multi-Event
+  - core_indicator: Event_RemoteService
+  - core_indicator: Net_RemoteProcessj
+  - core_indicator: Event_PrivUsage
+  - core_indicator: Cmd_RemoteShell
+  - datasource: SecurityEvent
+  - datasource: DeviceEvents
+  - datasource: DeviceProcessEvents
 
-time_window: 4h
-frequency: 15m
-trigger: results > 0
 query: |
 
-// Combined Data Exfiltration Detection - Staging, Compression, and Cloud Transfer
-// Detects the full attack chain: Archive creation -> Cloud tool usage -> Data transfer
+// Remote Service-Based Lateral Movement Detection
+// Detects PsExec, NetExec, and similar lateral movement tools via service creation + execution correlation
 
 // Parameters
-let LookbackWindow = 4h;
-let CorrelationWindow = 60m;  // Time window to correlate archive + upload
-let BaselineWindow = 14d;
-let LargeArchiveThreshold = 100MB;
-let LargeTransferThreshold = 50MB;
+let LookbackWindow = 2h;
+let CorrelationWindow = 10s;  // Tight window for service creation → execution
+let BaselineWindow = 7d;
 let Window = toduration(CorrelationWindow);
 
-// Known cloud storage tools and their indicators
-let CloudStorageTools = dynamic([
-    // Rclone variants
-    "rclone.exe", "rclone64.exe", "rclone32.exe",
-    // Azure Storage
-    "storageexplorer.exe", "azurestorageexplorer.exe", "azcopy.exe",
-    // MEGA
-    "megasync.exe", "megacmd.exe", "megatools.exe",
-    // Other cloud sync
-    "winscp.exe", "filezilla.exe", "cyberduck.exe",
-    // Command line tools
-    "curl.exe", "wget.exe", "powershell.exe"
+// Known legitimate service patterns (I doubt many of these are used in Microsoft, this is just "top stuff". Customize appropriately.)
+let LegitimateServices = dynamic([
+    // Windows built-in services
+    "TrustedInstaller", "wuauserv", "BITS", "EventLog", "Schedule", "WinDefend",
+    // Common enterprise software
+    "SplunkForwarder", "CrowdStrikeService", "SentinelOne", "CarbonBlack",
+    "SCCM", "WSUS", "Tanium", "McAfee", "Symantec",
+    // Known admin tools (if approved)
+    "RemoteRegistry", "RemoteAccess"
 ]);
 
-let CloudStorageDomains = dynamic([
-    // Major cloud storage providers
-    "rclone.org", "mega.nz", "mega.io", "megasync.net",
-    "dropbox.com", "box.com", "onedrive.live.com", 
-    "drive.google.com", "s3.amazonaws.com", "blob.core.windows.net",
-    "backblaze.com", "wasabi.com", "digitalocean.com",
-    // Personal/free storage
-    "mediafire.com", "4shared.com", "filemail.com", "wetransfer.com",
-    "sendspace.com", "zippyshare.com"
+// Suspicious service name patterns (common in lateral movement tools)
+let SuspiciousServicePatterns = dynamic([
+    "PSEXESVC",      // PsExec default
+    "PAExec",        // Alternative PsExec
+    "ADMIN$",        // SMB admin share
+    "IPC$",          // IPC share
+    "RemCom",        // RemCom service
+    "BTOBTO",        // NetExec/CrackMapExec
+    "WMIC",          // WMIC-based
+    "WinRM"          // WinRM remote exec
 ]);
 
-// Archive/compression tools
-let ArchiveTools = dynamic([
-    "7z.exe", "7za.exe", "7zg.exe", "7zfm.exe",
-    "winrar.exe", "rar.exe", "unrar.exe",
-    "zip.exe", "gzip.exe", "tar.exe",
-    "powershell.exe", "cmd.exe"  // Can create archives
+// Known lateral movement tools and their characteristics
+let LateralMovementTools = dynamic([
+    "psexec.exe", "psexec64.exe", "paexec.exe",
+    "netexec.exe", "crackmapexec.exe", "cme.exe",
+    "impacket", "smbexec.py", "atexec.py", "wmiexec.py",
+    "remcom.exe", "winexe"
 ]);
 
-let ArchiveExtensions = dynamic([
-    ".7z", ".zip", ".rar", ".tar", ".gz", ".bz2", 
-    ".xz", ".tar.gz", ".tgz", ".tar.bz2"
-]);
+// Module 1: Remote Service Creation Events
+let ServiceCreationEvents = 
+    SecurityEvent
+    | where TimeGenerated >= ago(LookbackWindow)
+    | where EventID == 4697  // A service was installed in the system
+    | extend
+        ServiceName = tostring(extract("Service Name:\\s+([^\\r\\n]+)", 1, EventData)),
+        ServiceFileName = tostring(extract("Service File Name:\\s+([^\\r\\n]+)", 1, EventData)),
+        ServiceAccount = tostring(extract("Service Account:\\s+([^\\r\\n]+)", 1, EventData)),
+        ServiceType = tostring(extract("Service Type:\\s+([^\\r\\n]+)", 1, EventData)),
+        // Extract initiator information
+        SubjectUserName = tostring(extract("Subject:\\s+Security ID:[^\\r\\n]+\\s+Account Name:\\s+([^\\r\\n]+)", 1, EventData)),
+        SubjectDomainName = tostring(extract("Subject:\\s+Security ID:[^\\r\\n]+\\s+Account Name:[^\\r\\n]+\\s+Account Domain:\\s+([^\\r\\n]+)", 1, EventData)),
+        SubjectLogonId = tostring(extract("Subject:\\s+Security ID:[^\\r\\n]+\\s+Account Name:[^\\r\\n]+\\s+Account Domain:[^\\r\\n]+\\s+Logon ID:\\s+([^\\r\\n]+)", 1, EventData))
+    | where isnotempty(ServiceName)
+    // Filter out known legitimate services
+    | where ServiceName !in (LegitimateServices)
+    // Identify suspicious characteristics
+    | extend
+        IsSuspiciousName = ServiceName has_any (SuspiciousServicePatterns),
+        IsRandomName = strlen(ServiceName) <= 8 and ServiceName matches regex "^[A-Z0-9]{6,8}$",
+        IsSystemPath = ServiceFileName startswith "C:\\Windows\\System32" or ServiceFileName startswith "C:\\Windows\\SysWOW64",
+        IsTempPath = ServiceFileName has_any ("\\Temp\\", "\\Tmp\\", "\\AppData\\", "\\ProgramData\\"),
+        IsAdminShare = ServiceFileName startswith "\\\\",
+        HasSuspiciousPath = ServiceFileName has_any ("cmd.exe", "powershell.exe", "wmic.exe", "rundll32.exe")
+    | project ServiceCreationTime = TimeGenerated,
+              TargetComputer = Computer,
+              ServiceName,
+              ServiceFileName,
+              ServiceAccount,
+              SubjectUserName,
+              SubjectDomainName,
+              SubjectLogonId,
+              IsSuspiciousName,
+              IsRandomName,
+              IsTempPath,
+              IsAdminShare,
+              HasSuspiciousPath;
 
-// Suspicious staging locations
-let StagingLocations = dynamic([
-    "\\temp\\", "\\tmp\\", "\\public\\", "\\users\\public\\",
-    "\\programdata\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\",
-    "c:\\temp\\", "c:\\tmp\\", "c:\\users\\public\\"
-]);
+// Alternative: EDR-based service creation.. this is a Defender vs Windows Event alternative
+let EDRServiceCreation = 
+    DeviceEvents
+    | where TimeGenerated >= ago(LookbackWindow)
+    | where ActionType == "ServiceInstalled"
+    | extend
+        ServiceName = tostring(AdditionalFields.ServiceName),
+        ServiceFileName = tostring(AdditionalFields.ImagePath),
+        ServiceAccount = tostring(AdditionalFields.AccountName)
+    | where isnotempty(ServiceName)
+    | where ServiceName !in (LegitimateServices)
+    | extend
+        IsSuspiciousName = ServiceName has_any (SuspiciousServicePatterns),
+        IsRandomName = strlen(ServiceName) <= 8 and ServiceName matches regex "^[A-Z0-9]{6,8}$",
+        IsTempPath = ServiceFileName has_any ("\\Temp\\", "\\Tmp\\", "\\AppData\\", "\\ProgramData\\"),
+        IsAdminShare = ServiceFileName startswith "\\\\",
+        HasSuspiciousPath = ServiceFileName has_any ("cmd.exe", "powershell.exe", "wmic.exe")
+    | project ServiceCreationTime = TimeGenerated,
+              TargetComputer = DeviceName,
+              ServiceName,
+              ServiceFileName,
+              ServiceAccount = InitiatingProcessAccountName,
+              SubjectUserName = InitiatingProcessAccountName,
+              SubjectDomainName = InitiatingProcessAccountDomain,
+              SubjectLogonId = InitiatingProcessAccountSid,
+              IsSuspiciousName,
+              IsRandomName,
+              IsTempPath,
+              IsAdminShare,
+              HasSuspiciousPath;
 
-// Legitimate backup/enterprise tools (for exclusions) - this is generated but not currently used.  Can be added if editing/filtering is needed.
-let LegitimateBackupTools = dynamic([
-    "veeam", "commvault", "backup", "acronis", "veritas",
-    "windows backup", "system restore", "windows server backup"
-]);
+// Combine both service creation sources
+let AllServiceCreation = union isfuzzy=true ServiceCreationEvents, EDRServiceCreation;
 
-// Module 1: Cloud Storage Tool Activity
-let CloudToolActivity = DeviceProcessEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where FileName in~ (CloudStorageTools)
-    or ProcessCommandLine has_any (CloudStorageTools)
-    or ProcessCommandLine has_any ("rclone", "azcopy", "megasync")
+// Module 2: Remote Process Execution (spawned by services.exe)
+let RemoteProcessExecution =
+    DeviceProcessEvents
+    | where TimeGenerated >= ago(LookbackWindow)
+    // Process spawned by services.exe (service execution)
+    | where InitiatingProcessFileName =~ "services.exe"
+        or InitiatingProcessCommandLine contains "services.exe"
+    // Focus on interactive/command execution processes
+    | where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "wmic.exe", 
+                          "rundll32.exe", "regsvr32.exe", "mshta.exe", "cscript.exe", "wscript.exe")
+        or ProcessCommandLine has_any ("cmd.exe /c", "powershell.exe -", "cmd /c", "cmd /q")
+    | extend
+        IsInteractiveShell = FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe"),
+        HasSuspiciousArgs = ProcessCommandLine has_any (
+            "-enc", "-EncodedCommand", "-WindowStyle Hidden", "-ExecutionPolicy Bypass",
+            "/c ", "whoami", "net user", "net group", "ipconfig", "systeminfo"
+        ),
+        IsLOLBAS = FileName in~ ("rundll32.exe", "regsvr32.exe", "mshta.exe", "wmic.exe")
+    | project ProcessCreationTime = TimeGenerated,
+              TargetComputer = DeviceName,
+              ProcessFileName = FileName,
+              ProcessCommandLine,
+              ProcessAccount = AccountName,
+              ProcessAccountDomain = AccountDomain,
+              ParentProcessName = InitiatingProcessFileName,
+              ParentProcessId = InitiatingProcessId,
+              IsInteractiveShell,
+              HasSuspiciousArgs,
+              IsLOLBAS;
+
+// Module 3: Remote Logon Context (for additional correlation)
+let RemoteLogons =
+    SecurityEvent
+    | where TimeGenerated >= ago(LookbackWindow)
+    | where EventID in (4624, 4672)  // Logon + Special privileges assigned
+    | where LogonType in (3, 10)     // Network logon or RemoteInteractive
+    | extend
+        LogonUserName = Account,
+        LogonDomain = AccountDomain,
+        LogonType = LogonType,
+        SourceIP = IpAddress,
+        LogonId = TargetLogonId
+    | project LogonTime = TimeGenerated,
+              TargetComputer = Computer,
+              LogonUserName,
+              LogonDomain,
+              SourceIP,
+              LogonId,
+              LogonType;
+
+// Module 4: Lateral Movement Tool Process Creation (source host context)
+let LateralToolExecution =
+    DeviceProcessEvents
+    | where TimeGenerated >= ago(LookbackWindow)
+    | where FileName has_any (LateralMovementTools)
+        or ProcessCommandLine has_any (LateralMovementTools)
+        or ProcessCommandLine has_any ("psexec", "\\\\", "wmic /node:", "Invoke-Command")
+    | extend
+        IsPsExec = FileName contains "psexec" or ProcessCommandLine contains "psexec",
+        IsNetExec = FileName contains "netexec" or FileName contains "crackmapexec",
+        IsWMIC = ProcessCommandLine contains "wmic /node:",
+        IsPowerShellRemoting = ProcessCommandLine contains "Invoke-Command" or ProcessCommandLine contains "Enter-PSSession",
+        TargetHost = extract(@"\\\\([^\s\\]+)", 1, ProcessCommandLine)
+    | where isnotempty(TargetHost) or IsPsExec or IsNetExec or IsWMIC or IsPowerShellRemoting
+    | project ToolExecutionTime = TimeGenerated,
+              SourceComputer = DeviceName,
+              ToolFileName = FileName,
+              ToolCommandLine = ProcessCommandLine,
+              ToolAccount = AccountName,
+              TargetHostFromCommand = TargetHost,
+              IsPsExec,
+              IsNetExec,
+              IsWMIC,
+              IsPowerShellRemoting;
+
+// Correlation 1: Service Creation → Process Execution (Core Detection)
+let ServiceToProcess = AllServiceCreation
+| join kind=inner (RemoteProcessExecution) on TargetComputer
+| where ProcessCreationTime between (ServiceCreationTime .. (ServiceCreationTime + Window))
+// Additional validation: Service name correlation - this is commented out for now as the time correlation should be strong enough.  Can be added back if needed.
+// | where ProcessCommandLine contains ServiceName 
+//    or ParentProcessName contains ServiceName
+//    or abs(datetime_diff('second', ProcessCreationTime, ServiceCreationTime)) <= 10
 | extend
-    IsRclone = FileName =~ "rclone.exe" or ProcessCommandLine contains "rclone",
-    IsAzureStorage = FileName contains "storage" or ProcessCommandLine contains "azcopy",
-    IsMega = FileName contains "mega" or ProcessCommandLine contains "mega",
-    HasConfigFlag = ProcessCommandLine has_any ("--config", "config", "/config"),
-    HasSyncFlag = ProcessCommandLine has_any ("sync", "copy", "move", "upload"),
-    IsFromUnusualPath = not(FolderPath has_any ("\\program files\\", "\\program files (x86)\\"))
-| project TimeGenerated, DeviceName, DeviceId, 
-          ToolFileName = FileName, ToolCommandLine = ProcessCommandLine,
-          ToolFolderPath = FolderPath, ToolAccountName = InitiatingProcessAccountName,
-          IsRclone, IsAzureStorage, IsMega, HasConfigFlag, HasSyncFlag, IsFromUnusualPath;
-
-// Module 2: Archive Creation Activity  
-let ArchiveActivity = DeviceFileEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where ActionType == "FileCreated"
-| where FileName endswith_cs ".7z" or FileName endswith_cs ".zip" or FileName endswith_cs ".rar"
-    or FileName endswith_cs ".tar" or FileName endswith_cs ".tar.gz" or FileName endswith_cs ".tgz"
-| extend
-    FileSize = tolong(FileSize),
-    FileSizeMB = tolong(FileSize) / 1048576,
-    IsLargeArchive = tolong(FileSize) > (LargeArchiveThreshold * 1048576),
-    IsInStagingLocation = FolderPath has_any (StagingLocations),
-    IsInUserProfile = FolderPath contains "\\users\\" and not(FolderPath contains "\\appdata\\"),
-    FileExtension = tolower(extract(@"(\.[^.]+)$", 1, FileName))
-| where FileSizeMB > 10  // Filter small archives (likely legitimate)
-| project TimeGenerated, DeviceName, DeviceId,
-          ArchiveFileName = FileName, ArchivePath = FolderPath,
-          FileSizeMB, IsLargeArchive, IsInStagingLocation, IsInUserProfile,
-          ArchiveCreator = InitiatingProcessAccountName, FileExtension;
-
-// Module 3: Archive Tool Execution (for context)
-let ArchiveToolExecution = DeviceProcessEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where FileName in~ (ArchiveTools)
-    or ProcessCommandLine has_any (ArchiveTools)
-| where ProcessCommandLine has_any ("a ", "archive", "compress", "-r", "/r") // Archive creation flags
-| extend
-    Is7Zip = FileName contains "7z",
-    IsWinRAR = FileName contains "rar",
-    IsRecursive = ProcessCommandLine has_any ("-r", "/r", "--recursive"),
-    HasPasswordFlag = ProcessCommandLine has_any ("-p", "/p", "--password"),
-    TargetPath = extract(@"(?:a|archive)\s+(?:""([^""]+)""|(\S+))", 1, ProcessCommandLine)
-| project TimeGenerated, DeviceName, DeviceId,
-          ArchiveToolName = FileName, ArchiveToolCommand = ProcessCommandLine,
-          Is7Zip, IsWinRAR, IsRecursive, HasPasswordFlag, TargetPath,
-          ToolAccountName = InitiatingProcessAccountName;
-
-// Module 4: Network Connections to Cloud Storage
-let CloudNetworkActivity = DeviceNetworkEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where ActionType == "ConnectionSuccess"
-| where RemoteUrl has_any (CloudStorageDomains)
-    or RemoteIPType == "Public" and RemotePort in (443, 80, 21, 22, 990, 989)
-| extend
-    IsKnownCloudDomain = RemoteUrl has_any (CloudStorageDomains),
-    BytesSentMB = tolong(SentBytes) / 1048576,
-    IsLargeTransfer = tolong(SentBytes) > (LargeTransferThreshold * 1048576)
-| where BytesSentMB > 1  // Filter noise
-| project TimeGenerated, DeviceName, DeviceId,
-          InitiatingProcessFileName, RemoteUrl, RemoteIP, RemotePort,
-          BytesSentMB, IsLargeTransfer, IsKnownCloudDomain,
-          NetworkAccountName = InitiatingProcessAccountName;
-
-// Correlation Logic: Combine all indicators
-
-// Correlation 1: Archive creation followed by cloud tool activity
-let Archive_Then_CloudTool = ArchiveActivity
-| join kind=inner (CloudToolActivity) on DeviceName, DeviceId
-| where CloudToolActivity.TimeGenerated between (ArchiveActivity.TimeGenerated .. (ArchiveActivity.TimeGenerated + Window))
-| extend 
-    Signal = "Archive_Then_CloudTool",
-    TimeDelta = datetime_diff('minute', CloudToolActivity.TimeGenerated, ArchiveActivity.TimeGenerated),
+    Signal = "Service_Then_Process",
+    TimeDelta = datetime_diff('second', ProcessCreationTime, ServiceCreationTime),
     Evidence = pack(
-        "ArchiveFile", ArchiveFileName,
-        "ArchiveSizeMB", FileSizeMB,
-        "CloudTool", ToolFileName,
-        "TimeBetween", TimeDelta
+        "ServiceCreationTime", ServiceCreationTime,
+        "ProcessExecutionTime", ProcessCreationTime,
+        "ServiceName", ServiceName,
+        "ServicePath", ServiceFileName,
+        "ExecutedProcess", ProcessCommandLine,
+        "TimeDeltaSeconds", TimeDelta
     );
 
-// Correlation 2: Archive creation followed by large network transfer
-let Archive_Then_Transfer = ArchiveActivity
-| join kind=inner (CloudNetworkActivity) on DeviceName, DeviceId
-| where CloudNetworkActivity.TimeGenerated between (ArchiveActivity.TimeGenerated .. (ArchiveActivity.TimeGenerated + Window))
+// Correlation 2: Lateral Tool → Service Creation → Process (Full Chain)
+let FullLateralChain = LateralToolExecution
+| join kind=inner (AllServiceCreation) on $left.TargetHostFromCommand == $right.TargetComputer
+| where ServiceCreationTime between (ToolExecutionTime .. (ToolExecutionTime + 30s))
+| join kind=inner (RemoteProcessExecution) on $left.TargetComputer == $right.TargetComputer
+| where ProcessCreationTime between (ServiceCreationTime .. (ServiceCreationTime + Window))
 | extend
-    Signal = "Archive_Then_Transfer",
-    TimeDelta = datetime_diff('minute', CloudNetworkActivity.TimeGenerated, ArchiveActivity.TimeGenerated),
+    Signal = "Tool_Service_Process_Chain",
     Evidence = pack(
-        "ArchiveFile", ArchiveFileName,
-        "ArchiveSizeMB", FileSizeMB,
-        "TransferDestination", RemoteUrl,
-        "TransferSizeMB", BytesSentMB,
-        "TimeBetween", TimeDelta
+        "SourceHost", SourceComputer,
+        "ToolUsed", ToolFileName,
+        "TargetHost", TargetComputer,
+        "ServiceCreated", ServiceName,
+        "ProcessExecuted", ProcessCommandLine,
+        "FullChainDuration", datetime_diff('second', ProcessCreationTime, ToolExecutionTime)
     );
 
-// Correlation 3: Cloud tool activity with large transfers
-let CloudTool_With_Transfer = CloudToolActivity
-| join kind=inner (CloudNetworkActivity) on DeviceName, DeviceId
-| where abs(datetime_diff('minute', CloudNetworkActivity.TimeGenerated, CloudToolActivity.TimeGenerated)) <= 5
+// Correlation 3: Remote Logon → Service → Process (Credential-based lateral movement)
+let LogonServiceProcess = RemoteLogons
+| join kind=inner (AllServiceCreation) on TargetComputer, $left.LogonId == $right.SubjectLogonId
+| where ServiceCreationTime between (LogonTime .. (LogonTime + 60s))
+| join kind=inner (RemoteProcessExecution) on TargetComputer
+| where ProcessCreationTime between (ServiceCreationTime .. (ServiceCreationTime + Window))
 | extend
-    Signal = "CloudTool_With_Transfer",
+    Signal = "Logon_Service_Process",
     Evidence = pack(
-        "CloudTool", ToolFileName,
-        "Destination", RemoteUrl,
-        "TransferSizeMB", BytesSentMB
-    );
-
-// Correlation 4: Archive tool execution followed by cloud activity
-let ArchiveTool_Then_Cloud = ArchiveToolExecution
-| join kind=inner (CloudToolActivity) on DeviceName, DeviceId  
-| where CloudToolActivity.TimeGenerated between (ArchiveToolExecution.TimeGenerated .. (ArchiveToolExecution.TimeGenerated + Window))
-| extend
-    Signal = "ArchiveTool_Then_Cloud",
-    TimeDelta = datetime_diff('minute', CloudToolActivity.TimeGenerated, ArchiveToolExecution.TimeGenerated),
-    Evidence = pack(
-        "ArchiveTool", ArchiveToolName,
-        "CloudTool", ToolFileName,
-        "TimeBetween", TimeDelta
+        "RemoteLogonFrom", SourceIP,
+        "LogonUser", LogonUserName,
+        "ServiceCreated", ServiceName,
+        "ProcessExecuted", ProcessCommandLine,
+        "LogonType", LogonType
     );
 
 // Combine all correlations
-let AllCorrelations = union isfuzzy=true 
-    Archive_Then_CloudTool,
-    Archive_Then_Transfer,
-    CloudTool_With_Transfer,
-    ArchiveTool_Then_Cloud
+let AllCorrelations = union isfuzzy=true ServiceToProcess, FullLateralChain, LogonServiceProcess
 | extend
-    User = coalesce(ArchiveCreator, ToolAccountName, NetworkAccountName),
-    Device = DeviceName,
-    SignalName = Signal;
+    User = coalesce(SubjectUserName, ToolAccount, LogonUserName, ProcessAccount),
+    Domain = coalesce(SubjectDomainName, LogonDomain, ProcessAccountDomain),
+    SourceHost = coalesce(SourceComputer, "Unknown"),
+    SignalType = Signal;
 
-// Score and aggregate by device/user
+// Risk Scoring and Analysis
 AllCorrelations
 | summarize
-    FirstSeen = min(TimeGenerated),
-    LastSeen = max(TimeGenerated),
+    FirstSeen = min(coalesce(ServiceCreationTime, ToolExecutionTime, LogonTime)),
+    LastSeen = max(coalesce(ProcessCreationTime, ServiceCreationTime)),
     Signals = make_list(pack(
-        "Signal", SignalName,
-        "Time", TimeGenerated,
+        "Signal", SignalType,
+        "Time", coalesce(ServiceCreationTime, ToolExecutionTime),
         "Evidence", Evidence
     )),
     SignalCount = count(),
-    UniqueSignals = dcount(SignalName),
-    ArchiveSizes = make_list(FileSizeMB),
-    CloudTools = make_set(ToolFileName),
-    Destinations = make_set(RemoteUrl)
-by Device, User
+    UniqueSignalTypes = dcount(SignalType),
+    ServicesCreated = make_set(ServiceName),
+    ProcessesExecuted = make_set(ProcessFileName),
+    ToolsUsed = make_set(ToolFileName),
+    SourceHosts = make_set(SourceHost)
+by TargetComputer, User, Domain
 | extend
-    // Calculate risk score
+    // Risk scoring
     BaseScore = case(
-        UniqueSignals >= 3, 60,  // Multiple correlation types
-        UniqueSignals == 2, 45,  // Two correlation types
-        UniqueSignals == 1, 30,  // Single correlation type
+        UniqueSignalTypes >= 3, 70,  // Full chain detected
+        UniqueSignalTypes == 2, 55,  // Partial chain
+        UniqueSignalTypes == 1, 40,  // Core correlation only
+        20
+    ),
+    
+    ServiceRiskBonus = case(
+        ServicesCreated has_any (SuspiciousServicePatterns), 20,  // Known tool patterns
+        array_length(ServicesCreated) > 2, 15,                    // Multiple services
         10
     ),
     
-    // Bonus factors
-    VolumeBonus = case(
-        array_length(ArchiveSizes) > 0 and ArchiveSizes[0] > 500, 20,  // Very large archives
-        array_length(ArchiveSizes) > 0 and ArchiveSizes[0] > 200, 10,  // Large archives
-        0
-    ),
-    
-    ToolBonus = case(
-        array_length(CloudTools) > 1, 15,  // Multiple cloud tools
-        CloudTools has "rclone", 10,        // Rclone specifically
-        CloudTools has "azcopy", 10,        // Azure Storage tools
+    ToolRiskBonus = case(
+        ToolsUsed has_any (LateralMovementTools), 15,  // Known lateral tool
+        array_length(ToolsUsed) > 0, 10,               // Tool usage detected
         5
     ),
     
-    TotalRiskScore = BaseScore + VolumeBonus + ToolBonus
+    ProcessRiskBonus = case(
+        ProcessesExecuted has "powershell", 10,  // PowerShell execution
+        ProcessesExecuted has "cmd.exe", 8,      // CMD execution
+        5
+    ),
+    
+    TotalRiskScore = BaseScore + ServiceRiskBonus + ToolRiskBonus + ProcessRiskBonus
 
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 80, "Critical",
-        TotalRiskScore >= 60, "High",
-        TotalRiskScore >= 40, "Medium",
+        TotalRiskScore >= 85, "Critical",
+        TotalRiskScore >= 70, "High",
+        TotalRiskScore >= 50, "Medium",
         "Low"
     ),
     
     ActivitySummary = pack(
         "SignalCount", SignalCount,
-        "UniqueSignalTypes", UniqueSignals,
-        "CloudTools", CloudTools,
-        "Destinations", Destinations,
+        "ChainTypes", UniqueSignalTypes,
+        "SourceHosts", SourceHosts,
+        "ServicesCreated", ServicesCreated,
+        "ProcessesExecuted", ProcessesExecuted,
+        "ToolsUsed", ToolsUsed,
         "Duration", datetime_diff('minute', LastSeen, FirstSeen)
     ),
     
     Recommendations = case(
         AlertSeverity == "Critical",
-        "IMMEDIATE: Isolate device, block cloud storage domains, analyze archives for sensitive data, revoke user credentials, check for lateral movement",
+        "IMMEDIATE: Isolate target and source hosts, terminate suspicious services, analyze process execution, check for additional lateral movement, revoke compromised credentials",
         AlertSeverity == "High",
-        "URGENT: Investigate archive contents, validate cloud tool legitimacy, check user authorization for data access, review network logs for full transfer scope",
+        "URGENT: Investigate service creation context, validate tool usage legitimacy, check user authorization for remote administration, review process execution logs",
         AlertSeverity == "Medium",
-        "INVESTIGATE: Verify business justification, confirm authorized backup/sync activity, review user data access patterns",
-        "MONITOR: Document for baseline tuning"
+        "INVESTIGATE: Verify authorized remote administration activity, confirm business justification, review service persistence",
+        "MONITOR: Document for baseline understanding"
     ),
     
-    DetectedTechniques = "T1560.001 (Archive via Utility), T1567.002 (Exfiltration to Cloud Storage), T1041 (Exfiltration Over C2 Channel)"
+    DetectedTechniques = "T1021.002 (Remote Services: SMB/Windows Admin Shares), T1543.003 (Create or Modify System Process: Windows Service), T1570 (Lateral Tool Transfer), T1047 (Windows Management Instrumentation)"
 
 | where AlertSeverity in ("Critical", "High", "Medium")
 | project
     TimeGenerated = LastSeen,
-    DeviceName = Device,
-    UserPrincipalName = User,
+    TargetComputer,
+    SourceComputers = SourceHosts,
+    UserPrincipalName = strcat(Domain, "\\", User),
     AlertSeverity,
     TotalRiskScore,
     ActivityWindowMinutes = datetime_diff('minute', LastSeen, FirstSeen),
     SignalCount,
-    UniqueSignalTypes = UniqueSignals,
-    CloudToolsUsed = CloudTools,
-    ExfiltrationDestinations = Destinations,
+    LateralMovementChain = UniqueSignalTypes,
+    ServicesCreated,
+    ProcessesExecuted,
+    ToolsUsed,
     Signals,
     ActivitySummary,
     DetectedTechniques,
     Recommendations
 | sort by TotalRiskScore desc, TimeGenerated desc
 
-
-
-entities:
-  - account:
-      field: UserPrincipalName
-  - host:
-      field: DeviceName
-  - process:
-      field: CloudToolsUsed
+time_window: 4h
+frequency: 15m
+trigger: results > 0
 
 fields_returned:
-  - TimeGenerated
-  - DeviceName
+  - LastSeen
+  - TargetComputer
+  - SourceHosts
   - UserPrincipalName
   - AlertSeverity
   - TotalRiskScore
   - ActivityWindowMinutes
   - SignalCount
-  - UniqueSignalTypes
-  - CloudToolsUsed
-  - ExfiltrationDestinations
+  - LateralMovementChain
+  - ServicesCreated
+  - ProcessesExecuted
+  - ToolsUsed
   - Signals
-  - Evidence
   - ActivitySummary
   - DetectedTechniques
   - Recommendations
-
-triage: |
-  1. Review Severity & Summary:
-     - Use AlertSeverity and TotalRiskScore to prioritize (Critical first).
-     - Expand ActivitySummary to see SignalCount, UniqueSignalTypes, CloudTools, Destinations.
-
-  2. Validate Artifacts:
-     - Review Signals and Evidence: archive filenames, archive sizes, cloud tool command lines, and network destinations.
-     - Confirm whether the archive creator and cloud tool account are legitimate (user/automation).
-
-  3. Enrichment:
-     - Lookup Destination IPs / domains in threat intel and proxy logs.
-     - Check host endpoint telemetry for process tree, spawned tools, newly created files, persistence, or scheduled tasks.
-     - Check SIEM/full-packet logs for additional transfer context (timestamps, bytes transferred).
-
-  4. Containment & Remediation (if confirmed malicious or high-confidence):
-     - Isolate the device from the network.
-     - Block or sinkhole exfil destinations at network/proxy level.
-     - Revoke or rotate credentials for implicated accounts and service principals.
-     - Collect full archive(s) for DLP/classification and forensic review.
-     - Hunt for lateral movement from the same account or device.
-
-  5. Validation & Tuning:
-     - If benign (backup/sync), add legitimate cloud tools/domains or backup products to allow-lists.
-     - Tune thresholds (LargeArchiveThreshold, LargeTransferThreshold, time window) to reduce false positives.
-     - Document findings and update incident tickets and playbooks.
 
 references:
   - https://attack.mitre.org/techniques/T1560/ (Archive Collected Data)
   - https://attack.mitre.org/techniques/T1567/ (Exfiltration to Cloud Storage)
   - https://learn.microsoft.com/azure/active-directory/ (tuning & investigation guidance)
+
+triage: |
+  1.	For Critical Alerting, Immediate Containment & Verification (Target and Source Hosts)
+    o	Isolate Target Host: Immediately isolate the TargetComputer to prevent further execution.
+    o	Isolate Source Host: Immediately isolate the SourceComputer (if identified in the SourceHosts field) as this is likely the attacker's initial foothold or pivot point.
+    o	Verify Legitimacy: Consult with the reported user (UserPrincipalName) and their manager to confirm if any legitimate remote administrative task was executed against the TargetComputer at the TimeGenerated. If denied, proceed as a breach.
+  2.	Credential Scoping
+    o	Review Account: Examine the account used (UserPrincipalName). Force a password reset and revoke all active sessions and refresh tokens immediately, as the credentials used for the service creation/remote login are compromised.
+    o	Check Admin Status: Determine if the account is a privileged administrator. If so, immediately check all privileged access logs for the past 24 hours.
+  3.	Artifact Analysis (On Target Host)
+    o	Check Services: Search the target host for any running services that match the suspicious service name patterns (PSEXESVC, random 6-8 character names) or the names listed in the ServicesCreated field. Terminate and delete them.
+    o	Analyze Command Line: Review the full command line (ProcessCommandLine within the Signals field) for the remote process execution. Look for known malicious payloads, base64-encoded strings, or enumeration commands (whoami, net group, ipconfig).
+    o	Check Tool Usage: If the ToolsUsed field shows a known lateral tool (psexec, netexec), review all associated logs on the Source Host for the tool's execution history.
+  4.	Scope and Escalation
+    o	Check Neighbors: Search the logs for any lateral movement attempts originating from the Target Host after the initial compromise, or any additional service creation events targeting other hosts.
+    o	Escalate: Immediately escalate, providing the Target Host, Source Host, Compromised Account, and the Services/Processes Executed as the initial data set.
+
+
+notes: |
+
