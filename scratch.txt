@@ -1,419 +1,337 @@
-# DE-HY25.07 Remote Service-Based Lateral Movement Detection
-id: DE-HY25.07
-title: Remote Service-Based Lateral Movement Detection
+# DE-HY25.08 Federation Trust Abuse Detection (Golden SAML Prevention)
+id: DE-HY25.08
+title: Federation Trust Abuse Detection (Golden SAML Prevention)
 description: |
-  Detects confirmed lateral movement by correlating remote service creation (e.g., PsExec, NetExec) on a target host with immediate command execution.
+  Detects unauthorized creation or modification of cloud identity federation settings (e.g., new domains, 
+  certificate uploads, issuer changes) indicative of Golden SAML persistence
 severity: High
 status: draft
 author: \m/
 date_created: 2025-10-16
 date_modified: 2025-10-16
 tags:
-  - clarifi_path: Endpoint/Windows/Lateral_Movement
-  - tactic: Lateral Movement
-  - tactic: Execution
-  - technique: Remote Services: SMB/Windows Admin Shares
-  - technique: Create or Modify System Process: Windows Service
-  - ATT&CK_ID: T1021.002 # Remote Services: SMB/Windows Admin Shares
-  - ATT&CK_ID: T1543.003 # Create or Modify System Process: Windows Service
-  - method: Correlation/Multi-Event
-  - core_indicator: Event_RemoteService
-  - core_indicator: Net_RemoteProcessj
+  - clarifi_path: Identity/Azure-AD/Persistence
+  - tactic: Defense Evasion
+  - tactic: Persistence
+  - technique: Forge Web Credentials: SAML Tokens
+  - technique: Domain Trust Modification
+  - ATT&CK_ID: T1606.002 # Forge Web Credentials: SAML Tokens
+  - ATT&CK_ID: T1484.002 # Domain Trust Modification
+  - method: Threshold/Context-Aware
+  - method: Behavioral/Model-Classification
+  - core_indicator: Event_FederationChange
+  - core_indicator: Event_GoldenSAML
   - core_indicator: Event_PrivUsage
-  - core_indicator: Cmd_RemoteShell
-  - datasource: SecurityEvent
-  - datasource: DeviceEvents
-  - datasource: DeviceProcessEvents
+  - datasource: AuditLogs
 
-query: |
+logic:
+  query: |
 
-// Remote Service-Based Lateral Movement Detection
-// Detects PsExec, NetExec, and similar lateral movement tools via service creation + execution correlation
+// Enhanced Federation Trust Abuse Detection (Golden SAML Prevention)
+// Detects unauthorized federation domain additions and certificate manipulation
 
 // Parameters
-let LookbackWindow = 2h;
-let CorrelationWindow = 10s;  // Tight window for service creation → execution
-let BaselineWindow = 7d;
-let Window = toduration(CorrelationWindow);
+let LookbackWindow = 7d;
+let BaselineWindow = 90d;  // Long baseline for rare operations - play around with it
 
-// Known legitimate service patterns (I doubt many of these are used in Microsoft, this is just "top stuff". Customize appropriately.)
-let LegitimateServices = dynamic([
-    // Windows built-in services
-    "TrustedInstaller", "wuauserv", "BITS", "EventLog", "Schedule", "WinDefend",
-    // Common enterprise software
-    "SplunkForwarder", "CrowdStrikeService", "SentinelOne", "CarbonBlack",
-    "SCCM", "WSUS", "Tanium", "McAfee", "Symantec",
-    // Known admin tools (if approved)
-    "RemoteRegistry", "RemoteAccess"
+// Approved federation configuration (CUSTOMIZE FOR ENVIRONMENT)
+let ApprovedFederationDomains = dynamic([
+    "contoso.com", 
+    "fabrikam.com"
+]); 
+
+// This is key - must have approved service principals.
+let ApprovedInitiators = dynamic([
+    "admin@contoso.com",
+    "identity-admin@contoso.com",
+    "system_automation@contoso.com"
 ]);
 
-// Suspicious service name patterns (common in lateral movement tools)
-let SuspiciousServicePatterns = dynamic([
-    "PSEXESVC",      // PsExec default
-    "PAExec",        // Alternative PsExec
-    "ADMIN$",        // SMB admin share
-    "IPC$",          // IPC share
-    "RemCom",        // RemCom service
-    "BTOBTO",        // NetExec/CrackMapExec
-    "WMIC",          // WMIC-based
-    "WinRM"          // WinRM remote exec
+// High-privilege identity roles that should be monitored
+let HighPrivilegeRoles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator", 
+    "Security Administrator",
+    "Hybrid Identity Administrator"
 ]);
 
-// Known lateral movement tools and their characteristics
-let LateralMovementTools = dynamic([
-    "psexec.exe", "psexec64.exe", "paexec.exe",
-    "netexec.exe", "crackmapexec.exe", "cme.exe",
-    "impacket", "smbexec.py", "atexec.py", "wmiexec.py",
-    "remcom.exe", "winexe"
+// Federation-related operations categorized by risk
+let CriticalFederationOps = dynamic([
+    "Add federated domain",
+    "Set domain authentication",
+    "Add service principal credentials",  // Certificate upload
+    "Update application – Certificates and secrets management"
 ]);
 
-// Module 1: Remote Service Creation Events
-let ServiceCreationEvents = 
-    SecurityEvent
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where EventID == 4697  // A service was installed in the system
-    | extend
-        ServiceName = tostring(extract("Service Name:\\s+([^\\r\\n]+)", 1, EventData)),
-        ServiceFileName = tostring(extract("Service File Name:\\s+([^\\r\\n]+)", 1, EventData)),
-        ServiceAccount = tostring(extract("Service Account:\\s+([^\\r\\n]+)", 1, EventData)),
-        ServiceType = tostring(extract("Service Type:\\s+([^\\r\\n]+)", 1, EventData)),
-        // Extract initiator information
-        SubjectUserName = tostring(extract("Subject:\\s+Security ID:[^\\r\\n]+\\s+Account Name:\\s+([^\\r\\n]+)", 1, EventData)),
-        SubjectDomainName = tostring(extract("Subject:\\s+Security ID:[^\\r\\n]+\\s+Account Name:[^\\r\\n]+\\s+Account Domain:\\s+([^\\r\\n]+)", 1, EventData)),
-        SubjectLogonId = tostring(extract("Subject:\\s+Security ID:[^\\r\\n]+\\s+Account Name:[^\\r\\n]+\\s+Account Domain:[^\\r\\n]+\\s+Logon ID:\\s+([^\\r\\n]+)", 1, EventData))
-    | where isnotempty(ServiceName)
-    // Filter out known legitimate services
-    | where ServiceName !in (LegitimateServices)
-    // Identify suspicious characteristics
-    | extend
-        IsSuspiciousName = ServiceName has_any (SuspiciousServicePatterns),
-        IsRandomName = strlen(ServiceName) <= 8 and ServiceName matches regex "^[A-Z0-9]{6,8}$",
-        IsSystemPath = ServiceFileName startswith "C:\\Windows\\System32" or ServiceFileName startswith "C:\\Windows\\SysWOW64",
-        IsTempPath = ServiceFileName has_any ("\\Temp\\", "\\Tmp\\", "\\AppData\\", "\\ProgramData\\"),
-        IsAdminShare = ServiceFileName startswith "\\\\",
-        HasSuspiciousPath = ServiceFileName has_any ("cmd.exe", "powershell.exe", "wmic.exe", "rundll32.exe")
-    | project ServiceCreationTime = TimeGenerated,
-              TargetComputer = Computer,
-              ServiceName,
-              ServiceFileName,
-              ServiceAccount,
-              SubjectUserName,
-              SubjectDomainName,
-              SubjectLogonId,
-              IsSuspiciousName,
-              IsRandomName,
-              IsTempPath,
-              IsAdminShare,
-              HasSuspiciousPath;
+let HighRiskFederationOps = dynamic([
+    "Update domain federation settings",
+    "Update federation settings on domain",
+    "Update domain",
+    "Set federation settings on domain"
+]);
 
-// Alternative: EDR-based service creation.. this is a Defender vs Windows Event alternative
-let EDRServiceCreation = 
-    DeviceEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where ActionType == "ServiceInstalled"
-    | extend
-        ServiceName = tostring(AdditionalFields.ServiceName),
-        ServiceFileName = tostring(AdditionalFields.ImagePath),
-        ServiceAccount = tostring(AdditionalFields.AccountName)
-    | where isnotempty(ServiceName)
-    | where ServiceName !in (LegitimateServices)
-    | extend
-        IsSuspiciousName = ServiceName has_any (SuspiciousServicePatterns),
-        IsRandomName = strlen(ServiceName) <= 8 and ServiceName matches regex "^[A-Z0-9]{6,8}$",
-        IsTempPath = ServiceFileName has_any ("\\Temp\\", "\\Tmp\\", "\\AppData\\", "\\ProgramData\\"),
-        IsAdminShare = ServiceFileName startswith "\\\\",
-        HasSuspiciousPath = ServiceFileName has_any ("cmd.exe", "powershell.exe", "wmic.exe")
-    | project ServiceCreationTime = TimeGenerated,
-              TargetComputer = DeviceName,
-              ServiceName,
-              ServiceFileName,
-              ServiceAccount = InitiatingProcessAccountName,
-              SubjectUserName = InitiatingProcessAccountName,
-              SubjectDomainName = InitiatingProcessAccountDomain,
-              SubjectLogonId = InitiatingProcessAccountSid,
-              IsSuspiciousName,
-              IsRandomName,
-              IsTempPath,
-              IsAdminShare,
-              HasSuspiciousPath;
+let MediumRiskFederationOps = dynamic([
+    "Add new domain",
+    "Update domain authentication",
+    "Add unverified domain"
+]);
 
-// Combine both service creation sources
-let AllServiceCreation = union isfuzzy=true ServiceCreationEvents, EDRServiceCreation;
+// Get historical baseline for federation operations
+let FederationBaseline =
+    AuditLogs
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(LookbackWindow))
+    | where OperationName has_any (CriticalFederationOps) 
+        or OperationName has_any (HighRiskFederationOps)
+        or OperationName has_any (MediumRiskFederationOps)
+    | summarize 
+        HistoricalCount = count(),
+        LastSeenBefore = max(TimeGenerated),
+        HistoricalInitiators = make_set(tostring(InitiatedBy.user.userPrincipalName))
+    by OperationName;
 
-// Module 2: Remote Process Execution (spawned by services.exe)
-let RemoteProcessExecution =
-    DeviceProcessEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    // Process spawned by services.exe (service execution)
-    | where InitiatingProcessFileName =~ "services.exe"
-        or InitiatingProcessCommandLine contains "services.exe"
-    // Focus on interactive/command execution processes
-    | where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "wmic.exe", 
-                          "rundll32.exe", "regsvr32.exe", "mshta.exe", "cscript.exe", "wscript.exe")
-        or ProcessCommandLine has_any ("cmd.exe /c", "powershell.exe -", "cmd /c", "cmd /q")
-    | extend
-        IsInteractiveShell = FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe"),
-        HasSuspiciousArgs = ProcessCommandLine has_any (
-            "-enc", "-EncodedCommand", "-WindowStyle Hidden", "-ExecutionPolicy Bypass",
-            "/c ", "whoami", "net user", "net group", "ipconfig", "systeminfo"
-        ),
-        IsLOLBAS = FileName in~ ("rundll32.exe", "regsvr32.exe", "mshta.exe", "wmic.exe")
-    | project ProcessCreationTime = TimeGenerated,
-              TargetComputer = DeviceName,
-              ProcessFileName = FileName,
-              ProcessCommandLine,
-              ProcessAccount = AccountName,
-              ProcessAccountDomain = AccountDomain,
-              ParentProcessName = InitiatingProcessFileName,
-              ParentProcessId = InitiatingProcessId,
-              IsInteractiveShell,
-              HasSuspiciousArgs,
-              IsLOLBAS;
-
-// Module 3: Remote Logon Context (for additional correlation)
-let RemoteLogons =
-    SecurityEvent
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where EventID in (4624, 4672)  // Logon + Special privileges assigned
-    | where LogonType in (3, 10)     // Network logon or RemoteInteractive
-    | extend
-        LogonUserName = Account,
-        LogonDomain = AccountDomain,
-        LogonType = LogonType,
-        SourceIP = IpAddress,
-        LogonId = TargetLogonId
-    | project LogonTime = TimeGenerated,
-              TargetComputer = Computer,
-              LogonUserName,
-              LogonDomain,
-              SourceIP,
-              LogonId,
-              LogonType;
-
-// Module 4: Lateral Movement Tool Process Creation (source host context)
-let LateralToolExecution =
-    DeviceProcessEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where FileName has_any (LateralMovementTools)
-        or ProcessCommandLine has_any (LateralMovementTools)
-        or ProcessCommandLine has_any ("psexec", "\\\\", "wmic /node:", "Invoke-Command")
-    | extend
-        IsPsExec = FileName contains "psexec" or ProcessCommandLine contains "psexec",
-        IsNetExec = FileName contains "netexec" or FileName contains "crackmapexec",
-        IsWMIC = ProcessCommandLine contains "wmic /node:",
-        IsPowerShellRemoting = ProcessCommandLine contains "Invoke-Command" or ProcessCommandLine contains "Enter-PSSession",
-        TargetHost = extract(@"\\\\([^\s\\]+)", 1, ProcessCommandLine)
-    | where isnotempty(TargetHost) or IsPsExec or IsNetExec or IsWMIC or IsPowerShellRemoting
-    | project ToolExecutionTime = TimeGenerated,
-              SourceComputer = DeviceName,
-              ToolFileName = FileName,
-              ToolCommandLine = ProcessCommandLine,
-              ToolAccount = AccountName,
-              TargetHostFromCommand = TargetHost,
-              IsPsExec,
-              IsNetExec,
-              IsWMIC,
-              IsPowerShellRemoting;
-
-// Correlation 1: Service Creation → Process Execution (Core Detection)
-let ServiceToProcess = AllServiceCreation
-| join kind=inner (RemoteProcessExecution) on TargetComputer
-| where ProcessCreationTime between (ServiceCreationTime .. (ServiceCreationTime + Window))
-// Additional validation: Service name correlation - this is commented out for now as the time correlation should be strong enough.  Can be added back if needed.
-// | where ProcessCommandLine contains ServiceName 
-//    or ParentProcessName contains ServiceName
-//    or abs(datetime_diff('second', ProcessCreationTime, ServiceCreationTime)) <= 10
+// Main Detection Query
+let FederationChanges = AuditLogs
+| where TimeGenerated >= ago(LookbackWindow)
+| where OperationName has_any (CriticalFederationOps)
+    or OperationName has_any (HighRiskFederationOps) 
+    or OperationName has_any (MediumRiskFederationOps)
 | extend
-    Signal = "Service_Then_Process",
-    TimeDelta = datetime_diff('second', ProcessCreationTime, ServiceCreationTime),
-    Evidence = pack(
-        "ServiceCreationTime", ServiceCreationTime,
-        "ProcessExecutionTime", ProcessCreationTime,
-        "ServiceName", ServiceName,
-        "ServicePath", ServiceFileName,
-        "ExecutedProcess", ProcessCommandLine,
-        "TimeDeltaSeconds", TimeDelta
-    );
+    // Properly parse InitiatedBy
+    Initiator = tostring(InitiatedBy.user.userPrincipalName),
+    InitiatorIP = tostring(InitiatedBy.user.ipAddress),
+    InitiatorApp = tostring(InitiatedBy.app.displayName),
+    
+    // Parse TargetResources (array of objects)
+    TargetResourcesParsed = parse_json(TargetResources),
+    
+    // Parse AdditionalDetails
+    AdditionalDetailsParsed = parse_json(AdditionalDetails)
 
-// Correlation 2: Lateral Tool → Service Creation → Process (Full Chain)
-let FullLateralChain = LateralToolExecution
-| join kind=inner (AllServiceCreation) on $left.TargetHostFromCommand == $right.TargetComputer
-| where ServiceCreationTime between (ToolExecutionTime .. (ToolExecutionTime + 30s))
-| join kind=inner (RemoteProcessExecution) on $left.TargetComputer == $right.TargetComputer
-| where ProcessCreationTime between (ServiceCreationTime .. (ServiceCreationTime + Window))
 | extend
-    Signal = "Tool_Service_Process_Chain",
-    Evidence = pack(
-        "SourceHost", SourceComputer,
-        "ToolUsed", ToolFileName,
-        "TargetHost", TargetComputer,
-        "ServiceCreated", ServiceName,
-        "ProcessExecuted", ProcessCommandLine,
-        "FullChainDuration", datetime_diff('second', ProcessCreationTime, ToolExecutionTime)
-    );
+    // Extract target domain information
+    TargetDomain = tostring(TargetResourcesParsed[0].displayName),
+    TargetType = tostring(TargetResourcesParsed[0].type),
+    TargetId = tostring(TargetResourcesParsed[0].id),
+    
+    // Extract modified properties (complex nested structure)
+    ModifiedProperties = TargetResourcesParsed[0].modifiedProperties
 
-// Correlation 3: Remote Logon → Service → Process (Credential-based lateral movement)
-let LogonServiceProcess = RemoteLogons
-| join kind=inner (AllServiceCreation) on TargetComputer, $left.LogonId == $right.SubjectLogonId
-| where ServiceCreationTime between (LogonTime .. (LogonTime + 60s))
-| join kind=inner (RemoteProcessExecution) on TargetComputer
-| where ProcessCreationTime between (ServiceCreationTime .. (ServiceCreationTime + Window))
 | extend
-    Signal = "Logon_Service_Process",
-    Evidence = pack(
-        "RemoteLogonFrom", SourceIP,
-        "LogonUser", LogonUserName,
-        "ServiceCreated", ServiceName,
-        "ProcessExecuted", ProcessCommandLine,
-        "LogonType", LogonType
-    );
+    // Parse modified properties for federation-specific changes
+    ModifiedPropertiesParsed = parse_json(ModifiedProperties)
 
-// Combine all correlations
-let AllCorrelations = union isfuzzy=true ServiceToProcess, FullLateralChain, LogonServiceProcess
+| mv-expand ModifiedPropertiesParsed
 | extend
-    User = coalesce(SubjectUserName, ToolAccount, LogonUserName, ProcessAccount),
-    Domain = coalesce(SubjectDomainName, LogonDomain, ProcessAccountDomain),
-    SourceHost = coalesce(SourceComputer, "Unknown"),
-    SignalType = Signal;
+    PropertyName = tostring(ModifiedPropertiesParsed.displayName),
+    OldValue = tostring(ModifiedPropertiesParsed.oldValue),
+    NewValue = tostring(ModifiedPropertiesParsed.newValue)
 
-// Risk Scoring and Analysis
-AllCorrelations
+// Aggregate modifications per event
 | summarize
-    FirstSeen = min(coalesce(ServiceCreationTime, ToolExecutionTime, LogonTime)),
-    LastSeen = max(coalesce(ProcessCreationTime, ServiceCreationTime)),
-    Signals = make_list(pack(
-        "Signal", SignalType,
-        "Time", coalesce(ServiceCreationTime, ToolExecutionTime),
-        "Evidence", Evidence
+    ModifiedPropertyNames = make_set(PropertyName),
+    ModifiedPropertyDetails = make_list(pack(
+        "Property", PropertyName,
+        "OldValue", OldValue,
+        "NewValue", NewValue
     )),
-    SignalCount = count(),
-    UniqueSignalTypes = dcount(SignalType),
-    ServicesCreated = make_set(ServiceName),
-    ProcessesExecuted = make_set(ProcessFileName),
-    ToolsUsed = make_set(ToolFileName),
-    SourceHosts = make_set(SourceHost)
-by TargetComputer, User, Domain
+    FirstModification = min(TimeGenerated)
+by TimeGenerated, OperationName, Initiator, InitiatorIP, InitiatorApp, 
+   TargetDomain, TargetType, TargetId, CorrelationId, Result
+
+| where isnotempty(Initiator) or isnotempty(InitiatorApp)
+
+// Enrich with context
 | extend
-    // Risk scoring
-    BaseScore = case(
-        UniqueSignalTypes >= 3, 70,  // Full chain detected
-        UniqueSignalTypes == 2, 55,  // Partial chain
-        UniqueSignalTypes == 1, 40,  // Core correlation only
-        20
+    // Classification flags
+    IsApprovedInitiator = Initiator in (ApprovedInitiators),
+    IsApprovedDomain = TargetDomain in (ApprovedFederationDomains),
+    
+    // Operation risk classification
+    IsCriticalOp = OperationName in (CriticalFederationOps),
+    IsHighRiskOp = OperationName in (HighRiskFederationOps),
+    
+    // Detect specific malicious indicators
+    IsCertificateChange = ModifiedPropertyNames has_any ("Certificate", "SigningCertificate", "KeyCredential", "Thumbprint"),
+    IsIssuerChange = ModifiedPropertyNames has_any ("IssuerUri", "FederationSettings", "PassiveSignInUri", "MetadataExchangeUri"),
+    IsAuthTypeChange = ModifiedPropertyNames has "Authentication",
+    IsNewDomainAddition = OperationName == "Add federated domain" or OperationName == "Add new domain",
+    
+    // Network risk indicators
+    IsExternalIP = not(ipv4_is_private(InitiatorIP)) and InitiatorIP != "",
+    
+    // Check if operation succeeded
+    IsSuccessful = Result =~ "success" or Result =~ "Success";
+
+// Join with baseline to detect anomalies
+FederationChanges
+| join kind=leftouter (FederationBaseline) on OperationName
+| extend
+    IsNewOperation = isnull(HistoricalCount) or HistoricalCount == 0,
+    IsNewInitiator = not(HistoricalInitiators has Initiator),
+    DaysSinceLastSeen = datetime_diff('day', TimeGenerated, LastSeenBefore);
+
+// Risk Scoring Engine
+FederationChanges
+| extend
+    // Base operation risk
+    OperationRisk = case(
+        IsCriticalOp, 50,
+        IsHighRiskOp, 35,
+        25
     ),
     
-    ServiceRiskBonus = case(
-        ServicesCreated has_any (SuspiciousServicePatterns), 20,  // Known tool patterns
-        array_length(ServicesCreated) > 2, 15,                    // Multiple services
-        10
-    ),
-    
-    ToolRiskBonus = case(
-        ToolsUsed has_any (LateralMovementTools), 15,  // Known lateral tool
-        array_length(ToolsUsed) > 0, 10,               // Tool usage detected
+    // Initiator risk
+    InitiatorRisk = case(
+        not(IsApprovedInitiator) and isnull(Initiator), 30,  // Service principal/app
+        not(IsApprovedInitiator), 25,                         // Unknown user
+        IsNewInitiator, 15,                                   // First time for this op
         5
     ),
     
-    ProcessRiskBonus = case(
-        ProcessesExecuted has "powershell", 10,  // PowerShell execution
-        ProcessesExecuted has "cmd.exe", 8,      // CMD execution
+    // Target risk
+    TargetRisk = case(
+        not(IsApprovedDomain) and IsNewDomainAddition, 20,  // New external domain
+        not(IsApprovedDomain), 15,                          // External domain modification
         5
     ),
     
-    TotalRiskScore = BaseScore + ServiceRiskBonus + ToolRiskBonus + ProcessRiskBonus
+    // Technical indicators risk
+    TechnicalRisk = case(
+        IsCertificateChange and IsIssuerChange, 25,  // Both changed (Golden SAML setup)
+        IsCertificateChange, 20,                     // Cert manipulation
+        IsIssuerChange, 18,                          // Issuer manipulation
+        IsAuthTypeChange, 15,                        // Auth type change
+        5
+    ),
+    
+    // Behavioral anomalies
+    BehavioralRisk = case(
+        IsNewOperation, 10,       // Never seen before
+        DaysSinceLastSeen > 180, 8,  // Haven't seen in 6 months
+        DaysSinceLastSeen > 90, 5,   // Haven't seen in 3 months
+        0
+    ),
+    
+    TotalRiskScore = OperationRisk + InitiatorRisk + TargetRisk + TechnicalRisk + BehavioralRisk
 
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 85, "Critical",
+        TotalRiskScore >= 90, "Critical",
         TotalRiskScore >= 70, "High",
         TotalRiskScore >= 50, "Medium",
         "Low"
+    )
+
+// Filter to actionable alerts
+| where AlertSeverity in ("Critical", "High", "Medium")
+| where IsSuccessful == true  // Only alert on successful changes
+
+// Prepare evidence package
+| extend
+    Evidence = pack(
+        "OperationName", OperationName,
+        "TargetDomain", TargetDomain,
+        "ModifiedProperties", ModifiedPropertyNames,
+        "ModificationDetails", ModifiedPropertyDetails,
+        "InitiatorIP", InitiatorIP,
+        "InitiatorApp", InitiatorApp,
+        "IsApprovedInitiator", IsApprovedInitiator,
+        "IsApprovedDomain", IsApprovedDomain,
+        "CertificateChanged", IsCertificateChange,
+        "IssuerChanged", IsIssuerChange,
+        "CorrelationId", CorrelationId
     ),
     
-    ActivitySummary = pack(
-        "SignalCount", SignalCount,
-        "ChainTypes", UniqueSignalTypes,
-        "SourceHosts", SourceHosts,
-        "ServicesCreated", ServicesCreated,
-        "ProcessesExecuted", ProcessesExecuted,
-        "ToolsUsed", ToolsUsed,
-        "Duration", datetime_diff('minute', LastSeen, FirstSeen)
+    ThreatContext = pack(
+        "AttackType", case(
+            IsCertificateChange and IsIssuerChange, "Potential Golden SAML Attack",
+            IsNewDomainAddition and not(IsApprovedDomain), "Unauthorized Federation Trust",
+            IsCertificateChange, "Federation Certificate Manipulation",
+            IsIssuerChange, "Federation Issuer Manipulation",
+            "Federation Configuration Change"
+        ),
+        "RiskFactors", strcat_array(
+            dynamic([
+                iff(not(IsApprovedInitiator), "Unapproved Initiator", ""),
+                iff(not(IsApprovedDomain), "Unapproved Domain", ""),
+                iff(IsCertificateChange, "Certificate Change", ""),
+                iff(IsIssuerChange, "Issuer Change", ""),
+                iff(IsNewOperation, "First Time Operation", "")
+            ]) | where strlen(tostring($0)) > 0,
+            ", "
+        )
     ),
     
     Recommendations = case(
         AlertSeverity == "Critical",
-        "IMMEDIATE: Isolate target and source hosts, terminate suspicious services, analyze process execution, check for additional lateral movement, revoke compromised credentials",
+        "IMMEDIATE P0 RESPONSE: 1) Disable initiating account 2) Review ALL federation settings and certificates 3) Check for unauthorized SAML token issuance 4) Validate all federated domains 5) Review sign-in logs for suspicious federated authentications 6) Engage incident response team - potential Golden SAML attack",
         AlertSeverity == "High",
-        "URGENT: Investigate service creation context, validate tool usage legitimacy, check user authorization for remote administration, review process execution logs",
-        AlertSeverity == "Medium",
-        "INVESTIGATE: Verify authorized remote administration activity, confirm business justification, review service persistence",
-        "MONITOR: Document for baseline understanding"
+        "URGENT: 1) Verify initiator authorization 2) Review federation configuration changes 3) Validate certificates and issuer URIs 4) Check recent federated sign-ins 5) Contact initiator to confirm legitimate action",
+        "INVESTIGATE: 1) Confirm business justification 2) Validate change was authorized 3) Document for baseline improvement"
     ),
     
-    DetectedTechniques = "T1021.002 (Remote Services: SMB/Windows Admin Shares), T1543.003 (Create or Modify System Process: Windows Service), T1570 (Lateral Tool Transfer), T1047 (Windows Management Instrumentation)"
+    DetectedTechniques = "T1484.002 (Domain Trust Modification), T1556.007 (Modify Authentication Process: Hybrid Identity), T1606.002 (Forge Web Credentials: SAML Tokens)"
 
-| where AlertSeverity in ("Critical", "High", "Medium")
+// Final output
 | project
-    TimeGenerated = LastSeen,
-    TargetComputer,
-    SourceComputers = SourceHosts,
-    UserPrincipalName = strcat(Domain, "\\", User),
+    TimeGenerated,
     AlertSeverity,
     TotalRiskScore,
-    ActivityWindowMinutes = datetime_diff('minute', LastSeen, FirstSeen),
-    SignalCount,
-    LateralMovementChain = UniqueSignalTypes,
-    ServicesCreated,
-    ProcessesExecuted,
-    ToolsUsed,
-    Signals,
-    ActivitySummary,
+    OperationName,
+    Initiator,
+    InitiatorIP,
+    InitiatorApp,
+    TargetDomain,
+    ThreatContext,
+    Evidence,
     DetectedTechniques,
-    Recommendations
+    Recommendations,
+    CorrelationId
+
 | sort by TotalRiskScore desc, TimeGenerated desc
 
-time_window: 4h
-frequency: 15m
+time_window: 7d
+frequency: 24h
 trigger: results > 0
 
 fields_returned:
-  - LastSeen
-  - TargetComputer
-  - SourceHosts
-  - UserPrincipalName
   - AlertSeverity
   - TotalRiskScore
-  - ActivityWindowMinutes
-  - SignalCount
-  - LateralMovementChain
-  - ServicesCreated
-  - ProcessesExecuted
-  - ToolsUsed
-  - Signals
-  - ActivitySummary
+  - OperationName
+  - Initiator
+  - InitiatorIP
+  - InitiatorApp
+  - TargetDomain
+  - ThreatContext
+  - Evidence
   - DetectedTechniques
   - Recommendations
+  - CorrelationId
 
 references:
-  - https://attack.mitre.org/techniques/T1560/ (Archive Collected Data)
-  - https://attack.mitre.org/techniques/T1567/ (Exfiltration to Cloud Storage)
-  - https://learn.microsoft.com/azure/active-directory/ (tuning & investigation guidance)
+  - https://attack.mitre.org/techniques/T1606/002/
+  - https://attack.mitre.org/techniques/T1484/002/ 
+  - https://www.cyberark.com/resources/threat-research-blog/golden-saml-newly-discovered-attack-technique-forges-authentication-to-cloud-apps
+  - https://www.sygnia.co/threat-reports-and-advisories/golden-saml-attack/
+  - https://www.hunters.security/en/blog/adfs-threat-hunting-2-golden-saml
 
 triage: |
-  1.	For Critical Alerting, Immediate Containment & Verification (Target and Source Hosts)
-    o	Isolate Target Host: Immediately isolate the TargetComputer to prevent further execution.
-    o	Isolate Source Host: Immediately isolate the SourceComputer (if identified in the SourceHosts field) as this is likely the attacker's initial foothold or pivot point.
-    o	Verify Legitimacy: Consult with the reported user (UserPrincipalName) and their manager to confirm if any legitimate remote administrative task was executed against the TargetComputer at the TimeGenerated. If denied, proceed as a breach.
-  2.	Credential Scoping
-    o	Review Account: Examine the account used (UserPrincipalName). Force a password reset and revoke all active sessions and refresh tokens immediately, as the credentials used for the service creation/remote login are compromised.
-    o	Check Admin Status: Determine if the account is a privileged administrator. If so, immediately check all privileged access logs for the past 24 hours.
-  3.	Artifact Analysis (On Target Host)
-    o	Check Services: Search the target host for any running services that match the suspicious service name patterns (PSEXESVC, random 6-8 character names) or the names listed in the ServicesCreated field. Terminate and delete them.
-    o	Analyze Command Line: Review the full command line (ProcessCommandLine within the Signals field) for the remote process execution. Look for known malicious payloads, base64-encoded strings, or enumeration commands (whoami, net group, ipconfig).
-    o	Check Tool Usage: If the ToolsUsed field shows a known lateral tool (psexec, netexec), review all associated logs on the Source Host for the tool's execution history.
-  4.	Scope and Escalation
-    o	Check Neighbors: Search the logs for any lateral movement attempts originating from the Target Host after the initial compromise, or any additional service creation events targeting other hosts.
-    o	Escalate: Immediately escalate, providing the Target Host, Source Host, Compromised Account, and the Services/Processes Executed as the initial data set.
+  This alert means an attacker may have established a global, stealthy backdoor (Golden SAML attack). Speed is paramount.
+  1.	Immediate Containment & Privilege Revocation:
+    o	Disable Initiator: Immediately disable the Initiator account (Initiator@domain.com) to prevent further tenant configuration changes. This credential is confirmed compromised.
+    o	Revoke Sessions: Force a password reset and immediately revoke all active sessions and refresh tokens for the initiating user.
+  2.	Federation Configuration Verification (The Reversion):
+    o	Check Federation Settings: Navigate directly to the federation settings for the TargetDomain.
+    o	Scrutinize Changes: Focus on the specific properties listed in the Evidence (e.g., IssuerUri, SigningCertificate).
+    o	Revert Unauthorized Changes: Immediately revert or delete any unauthorized or suspicious IssuerUri or SigningCertificate. If an unauthorized domain was added, delete it. If unsure, take screenshots first, but prioritize reverting the change to block the attack vector.
+  3.	Authentication/Token Scoping:
+    o	Check Federated Sign-ins: Search the sign-in logs for federated sign-ins that occurred after the suspicious change time (TimeGenerated). Look for authentication events matching the suspicious TargetDomain or any unexpected IP addresses/locations, as these could be tokens forged by the attacker.
+    o	Token Invalidation: If possible, execute a global token invalidation to force all users to re-authenticate, which mitigates the use of any forged SAML tokens created before the reversion.
+  4.	Forensic and Scoping Analysis:
+    o	Source IP: Analyze the InitiatorIP for known malicious or foreign origins.
+    o	Identify Origin: If the initiator was a Service Principal/App (InitiatorApp), determine which system or function executed the command and review that system's logs for compromise.
+    o	Escalate: Immediately escalate to the Incident Response (IR) team, clearly stating that a potential Golden SAML persistence mechanism was detected and largely contained by reversion.
+
 
 
 notes: |
