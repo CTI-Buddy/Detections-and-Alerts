@@ -1,27 +1,24 @@
-# DE-HY25.09 WMI Event Subscription Persistence Detection 
-id: DE-HY25.09
-title: WMI Event Subscription Persistence Detection 
+# DE-HY25.10 Credential Access: LSASS Memory Dumping Detection
+id: DE-HY25.10
+title: Credential Access: LSASS Memory Dumping Detection
 description: |
-  Detects the creation of WMI permanent event subscriptions (Filter, Consumer, Binding triad) 
-  via PowerShell, WMIC, or API, a stealthy fileless persistence technique
+  Detects credential access attempts against the LSASS process memory, including known tools, 
+  command line targeting, and the creation of memory dump artifacts.
 severity: High
 status: draft
 author: \m/
 date_created: 2025-10-17
 date_modified: 2025-10-17
 tags:
-  - clarifi_path: Windows/Endpoint/Persistence
-  - tactic: Defense Evasion
-  - tactic: Persistence
-  - technique: Event Triggered Execution: WMI Event Subscription
-  - technique: Windows Management Instrumentation
-  - ATT&CK_ID: T1546.003 # Event Triggered Execution: WMI Event Subscription
-  - ATT&CK_ID: T1047 # Windows Management Instrumentation
+  - clarifi_path: Windows/Endpoint/Credential_Access
+  - tactic: Credential Access
+  - technique: OS Credential Dumping: LSASS Memory
+  - ATT&CK_ID: T1003.001 # OS Credential Dumping: LSASS Memory
+  - method: Correlation/Multi-Event
   - method: Signature/String-Match
-  - method: Statistical/Baseline-Comparison
-  - core_indicator: Event_WMI_Persistence
-  - core_indicator: Cmd_Encoded
-  - core_indicator: File_Persistence_Artifact
+  - core_indicator: Cmd_DumpTool
+  - core_indicator: File_MemoryDump
+  - core_indicator: Event_LSASS
   - datasource: DeviceProcessEvents
   - datasource: DeviceEvents
   - datasource: DeviceFileEvents
@@ -29,272 +26,213 @@ tags:
 logic:
   query: |
 
-// WMI Event Subscription Persistence Detection 
-// Detects WMI permanent event subscriptions via process activity and WMI operations
+// Credential Access: LSASS Memory Dumping Detection
+// Optimized for Microsoft Defender for Endpoint / Microsoft Sentinel
 
-// Parameters
-let LookbackWindow = 7d;
-let CorrelationWindow = 5m;
-let BaselineWindow = 90d;
+// Configuration
+let LookbackWindow = 2h;
+let CorrelationWindow = 30s;
 
-// Legitimate WMI usage patterns (add more here during initial testing)
-let LegitimateWMIProcesses = dynamic([
-    "sccm.exe", "ccmexec.exe",           // SCCM/ConfigMgr
-    "taniumclient.exe",                   // Tanium
-    "splunkd.exe", "splunkforwarder.exe", // Splunk
-    "msmpeng.exe", "msseces.exe",         // Windows Defender
-    "veeam", "backup"                     // Backup software
+// Known attack tools
+let LSASS_DumpTools = dynamic([
+    "mimikatz.exe", "lazagne.exe", "procdump.exe", "procdump64.exe", 
+    "dumpit.exe", "out-minidump.exe", "comsvcs.dll", "nanodump.exe",
+    "hashcat.exe", "fgdump.exe", "pwdump.exe", "gsecdump.exe"
 ]);
 
-let LegitimateWMINamespaces = dynamic([
-    "root\\ccm",           // SCCM
-    "root\\SecurityCenter" // Windows Security Center
+// Legitimate processes that may access LSASS
+let LegitimateProcesses = dynamic([
+    "MsMpEng.exe", "SenseIR.exe", "SenseCncProxy.exe", 
+    "HealthService.exe", "csrss.exe", "smss.exe",
+    "Microsoft.Identity.AadConnect.Health.AadSync.Host.exe"
 ]);
 
-// Suspicious consumer payloads (some of these can be removed for tuning but these are generally how the attack works)
-let SuspiciousPayloads = dynamic([
-    "powershell", "cmd.exe", "rundll32", "mshta", "wscript", "cscript",
-    "regsvr32", "certutil", "bitsadmin", "msiexec",
-    "-enc", "-e ", "IEX", "Invoke-Expression", "DownloadString",
-    "http://", "https://", "ftp://"
-]);
+// Common memory dump extensions
+let DumpFileExtensions = dynamic([".dmp", ".bin", ".log", ".mem", ".tmp", ".mdmp", ".hdmp"]);
 
-// Get baseline of WMI activity
-let WMIBaseline = 
-    DeviceProcessEvents
-    | where TimeGenerated between (ago(BaselineWindow) .. ago(LookbackWindow))
-    | where ProcessCommandLine has_any ("Register-WmiEvent", "Set-WmiInstance", "wmic /namespace")
-    | summarize 
-        BaselineCount = count(),
-        BaselineInitiators = make_set(InitiatingProcessFileName)
-    by DeviceName;
-
-// Module 1: PowerShell-based WMI Event Subscription Creation
-let PowerShellWMISubscription = 
-    DeviceProcessEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where FileName in~ ("powershell.exe", "pwsh.exe")
-    // Detect PowerShell WMI subscription cmdlets
-    | where ProcessCommandLine has_any (
-        "Register-WmiEvent",
-        "Set-WmiInstance",
-        "__EventFilter",
-        "__EventConsumer", 
-        "__FilterToConsumerBinding",
-        "ActiveScriptEventConsumer",
-        "CommandLineEventConsumer"
+// --- Module 1: LSASS Process Access Detection ---
+let LSASS_Access = DeviceEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ActionType == "ProcessAccess"
+| where isnotempty(FileName)
+| extend
+    TargetProcess = tostring(AdditionalFields.TargetFileName),
+    TargetProcessId = tostring(AdditionalFields.TargetProcessId),
+    AccessMask = tostring(AdditionalFields.AccessMask)
+| where TargetProcess =~ "lsass.exe"
+| extend
+    // Enhanced access mask detection for MDE
+    IsHighRiskAccess = AccessMask has_any (
+        "0x1010", "0x1410", "0x1438", "0x1400",
+        "0x1fffff", "0x1f0fff", "0x001FFFFF"
     )
-    | extend
-        IsFilterCreation = ProcessCommandLine has "__EventFilter",
-        IsConsumerCreation = ProcessCommandLine has_any ("__EventConsumer", "CommandLineEventConsumer", "ActiveScriptEventConsumer"),
-        IsBindingCreation = ProcessCommandLine has "__FilterToConsumerBinding",
-        HasSuspiciousPayload = ProcessCommandLine has_any (SuspiciousPayloads),
-        WMINamespace = extract(@"namespace[:\s]+([^\s;""']+)", 1, ProcessCommandLine),
-        ConsumerPayload = extract(@"CommandLineTemplate[:\s]*=\s*[""']([^""']+)[""']", 1, ProcessCommandLine)
-    | where IsFilterCreation or IsConsumerCreation or IsBindingCreation
-    | extend
-        DetectionMethod = "PowerShell-WMI-Cmdlet",
-        WMIComponent = case(
-            IsFilterCreation, "Filter",
-            IsConsumerCreation, "Consumer", 
-            IsBindingCreation, "Binding",
-            "Unknown"
-        )
-    | project TimeGenerated, DeviceName, DetectionMethod, WMIComponent,
-              ProcessCommandLine, ConsumerPayload, WMINamespace,
-              InitiatingProcessFileName, AccountName, AccountDomain,
-              HasSuspiciousPayload;
-
-// Module 2: WMIC.exe-based WMI Event Subscription
-let WMICSubscription =
-    DeviceProcessEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where FileName =~ "wmic.exe"
-    | where ProcessCommandLine has_any ("/namespace", "path __EventFilter", "path __EventConsumer", "path __FilterToConsumerBinding")
-    | extend
-        IsFilterCreation = ProcessCommandLine has "__EventFilter",
-        IsConsumerCreation = ProcessCommandLine has "__EventConsumer",
-        IsBindingCreation = ProcessCommandLine has "__FilterToConsumerBinding",
-        HasSuspiciousPayload = ProcessCommandLine has_any (SuspiciousPayloads),
-        WMINamespace = extract(@"/namespace:\\\\[^\\]+\\([^\s]+)", 1, ProcessCommandLine),
-        ConsumerPayload = extract(@"ExecutablePath[=\s]+""?([^""]+)""?", 1, ProcessCommandLine)
-    | where IsFilterCreation or IsConsumerCreation or IsBindingCreation
-    | extend
-        DetectionMethod = "WMIC-CLI",
-        WMIComponent = case(
-            IsFilterCreation, "Filter",
-            IsConsumerCreation, "Consumer",
-            IsBindingCreation, "Binding",
-            "Unknown"
-        )
-    | project TimeGenerated, DeviceName, DetectionMethod, WMIComponent,
-              ProcessCommandLine, ConsumerPayload, WMINamespace,
-              InitiatingProcessFileName, AccountName, AccountDomain,
-              HasSuspiciousPayload;
-
-// Module 3: WMI COM/API-based Subscription (via suspicious processes)
-let COMWMISubscription =
-    DeviceEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where ActionType == "WmiBindEventFilterToConsumer"  // If your EDR provides this
-    | extend
-        DetectionMethod = "WMI-COM-API",
-        WMIComponent = "Binding",  // Binding event indicates complete subscription
-        ConsumerPayload = tostring(AdditionalFields.Consumer),
-        WMINamespace = tostring(AdditionalFields.Namespace),
-        HasSuspiciousPayload = tostring(AdditionalFields.Consumer) has_any (SuspiciousPayloads)
-    | project TimeGenerated, DeviceName, DetectionMethod, WMIComponent,
-              ProcessCommandLine = "", ConsumerPayload, WMINamespace,
-              InitiatingProcessFileName, AccountName, AccountDomain,
-              HasSuspiciousPayload;
-
-// Module 4: WMI Repository File Modification (alternative detection.. can comment out if this doesn't work out as intended)
-let WMIRepositoryChange =
-    DeviceFileEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | where FolderPath has "Windows\\System32\\wbem\\Repository"
-    | where FileName in~ ("OBJECTS.DATA", "INDEX.BTR", "MAPPING1.MAP", "MAPPING2.MAP")
-    | where ActionType in ("FileCreated", "FileModified")
-    | where InitiatingProcessFileName !in (LegitimateWMIProcesses)
-    | extend
-        DetectionMethod = "WMI-Repository-Modification",
-        WMIComponent = "Repository-Change",
-        HasSuspiciousPayload = false
-    | project TimeGenerated, DeviceName, DetectionMethod, WMIComponent,
-              ProcessCommandLine = InitiatingProcessCommandLine, 
-              ConsumerPayload = FileName, WMINamespace = "",
-              InitiatingProcessFileName, AccountName, AccountDomain,
-              HasSuspiciousPayload;
-
-// Combine all detection methods
-let AllWMIActivity = union isfuzzy=true 
-    PowerShellWMISubscription,
-    WMICSubscription,
-    COMWMISubscription,
-    WMIRepositoryChange;
-
-// Correlation: Detect complete subscription creation (Filter + Consumer + Binding)
-AllWMIActivity
-| extend CorrelationWindow = bin(TimeGenerated, 5m)
-| summarize
-    WMIComponents = make_set(WMIComponent),
-    DetectionMethods = make_set(DetectionMethod),
-    FirstActivity = min(TimeGenerated),
-    LastActivity = max(TimeGenerated),
-    CommandLines = make_set(ProcessCommandLine),
-    Payloads = make_set(ConsumerPayload),
-    Namespaces = make_set(WMINamespace),
-    InitiatingProcesses = make_set(InitiatingProcessFileName),
-    HasAnySuspiciousPayload = max(toint(HasSuspiciousPayload)),
-    ActivityCount = count()
-by DeviceName, AccountName, AccountDomain, CorrelationWindow
+| where IsHighRiskAccess
 | extend
-    HasFilter = WMIComponents has "Filter",
-    HasConsumer = WMIComponents has "Consumer",
-    HasBinding = WMIComponents has "Binding" or WMIComponents has "Repository-Change",
-    TimeDeltaSeconds = datetime_diff('second', LastActivity, FirstActivity),
-    IsCompleteSubscription = array_length(WMIComponents) >= 2  // At least 2 components (some methods auto-bind)
-
-// Risk Scoring
+    AttackerProcess = FileName,
+    AttackerProcessId = ProcessId,
+    AttackerProcessCommandLine = ProcessCommandLine,
+    AttackerAccount = AccountName,
+    AttackerParentProcess = InitiatingProcessFileName,
+    AttackerParentCommandLine = InitiatingProcessCommandLine
+// Filter out known legitimate processes
+| where AttackerProcess !in~ (LegitimateProcesses)
 | extend
-    // Base risk for WMI subscription activity
+    IsTaskManager = AttackerProcess =~ "taskmgr.exe",
+    IsLOLBin = AttackerProcess in~ ("cmd.exe", "powershell.exe", "rundll32.exe", "wscript.exe", "cscript.exe"),
+    LSASSAccessTime = TimeGenerated,
+    CorrelationKey = strcat(DeviceName, "_", AttackerProcessId)
+| project TimeGenerated, DeviceName, AttackerProcess, AttackerProcessCommandLine, AttackerAccount,
+          AttackerProcessId, AttackerParentProcess, TargetProcessId, AccessMask, IsTaskManager, IsLOLBin,
+          LSASSAccessTime, CorrelationKey, DeviceCorrelationKey = DeviceName;
+
+// --- Module 2: Credential Dumping Tool Execution ---
+let Tool_Execution = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where FileName has_any (LSASS_DumpTools) 
+    or ProcessCommandLine has_any ("sekurlsa", "logonpasswords", "lsadump", "-ma lsass")
+| extend
+    IsKnownTool = true,
+    AttackerAccount = AccountName,
+    AttackerParentProcess = InitiatingProcessFileName
+| project TimeGenerated, DeviceName, AttackerProcess = FileName, 
+          AttackerProcessCommandLine = ProcessCommandLine, AttackerAccount,
+          AttackerParentProcess, IsKnownTool, CorrelationKey = DeviceName;
+
+// --- Module 3: CommandLine-Based LSASS Targeting ---
+let CommandLine_Targeting = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ProcessCommandLine has_any ("lsass.exe", "lsass.dmp", "-ma lsass", "comsvcs.dll", "MiniDump")
+    and ProcessCommandLine !has "Get-Process lsass"  // Exclude benign queries
+| extend
+    AttackerAccount = AccountName,
+    AttackerParentProcess = InitiatingProcessFileName,
+    IsCOMSvcsDump = ProcessCommandLine has "comsvcs.dll" and ProcessCommandLine has "lsass"
+| project TimeGenerated, DeviceName, AttackerProcess = FileName, 
+          AttackerProcessCommandLine = ProcessCommandLine, AttackerAccount,
+          AttackerParentProcess, IsCOMSvcsDump, CorrelationKey = DeviceName;
+
+// --- Module 4: Suspicious Memory Dump File Creation ---
+let Dump_File_Creation = DeviceFileEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ActionType in ("FileCreated", "FileModified")
+| where isnotempty(FileName)
+| where (FileName has_any (DumpFileExtensions) and FileSize > 1000000)
+    or (FileName contains "lsass" and FileSize > 500000)
+    or (FolderPath has_any ("\\Temp\\", "\\AppData\\", "\\ProgramData\\", "\\Public\\") and FileSize > 40000000)
+| extend
+    IsMemoryDump = true,
+    DumpFileName = FileName,
+    DumpFilePath = FolderPath,
+    FileCreator = InitiatingProcessFileName,
+    FileCreatorCommandLine = InitiatingProcessCommandLine,
+    DumpFileCreationTime = TimeGenerated,
+    IsSuspiciousLocation = FolderPath has_any ("\\Temp\\", "\\AppData\\", "\\Public\\"),
+    HasLSASSInName = FileName contains "lsass",
+    CorrelationKey = DeviceName
+| project TimeGenerated, DeviceName, DumpFileName, DumpFilePath, FileCreator, FileCreatorCommandLine,
+          FileSize, DumpFileCreationTime, IsSuspiciousLocation, HasLSASSInName, CorrelationKey;
+
+// --- Correlation Layer ---
+// High-fidelity: LSASS Access + Dump File
+let Correlated_Access_Dump = LSASS_Access
+| join kind=inner (Dump_File_Creation) on DeviceCorrelationKey
+| where DumpFileCreationTime between (LSASSAccessTime .. (LSASSAccessTime + CorrelationWindow))
+| extend
+    Signal = "LSASS_Access_with_Dump_File",
+    TimeDelta = datetime_diff('second', DumpFileCreationTime, LSASSAccessTime)
+| project TimeGenerated = DumpFileCreationTime, DeviceName, AttackerProcess, AttackerProcessCommandLine,
+          AttackerAccount, AttackerParentProcess, AttackerProcessId, DumpFileName, DumpFilePath, 
+          FileCreator, FileSize, TimeDelta, Signal, IsTaskManager, IsLOLBin, 
+          IsSuspiciousLocation, HasLSASSInName;
+
+// Standalone LSASS Access (no correlated dump file)
+let Standalone_Access = LSASS_Access
+| join kind=leftanti (Dump_File_Creation) on DeviceCorrelationKey
+| extend Signal = "LSASS_Access_Only"
+| project TimeGenerated, DeviceName, AttackerProcess, AttackerProcessCommandLine,
+          AttackerAccount, AttackerParentProcess, Signal, IsTaskManager, IsLOLBin,
+          DumpFileName = "", DumpFilePath = "", FileCreator = "", FileSize = long(null),
+          IsSuspiciousLocation = false, HasLSASSInName = false;
+
+// --- Consolidate All Detections ---
+let AllDetections = union
+    (Correlated_Access_Dump),
+    (Standalone_Access),
+    (Tool_Execution | extend Signal = "Known_Dump_Tool_Executed"),
+    (CommandLine_Targeting | extend Signal = "LSASS_CommandLine_Targeting")
+| extend
+    // Ensure all fields exist for scoring
+    IsTaskManager = coalesce(IsTaskManager, false),
+    IsLOLBin = coalesce(IsLOLBin, false),
+    IsSuspiciousLocation = coalesce(IsSuspiciousLocation, false),
+    HasLSASSInName = coalesce(HasLSASSInName, false),
+    IsCOMSvcsDump = coalesce(IsCOMSvcsDump, false),
+    IsKnownTool = coalesce(IsKnownTool, false);
+
+// --- Risk Scoring and Prioritization ---
+AllDetections
+| extend
     BaseRisk = case(
-        HasFilter and HasConsumer and HasBinding, 50,  // Complete triad
-        HasFilter and HasConsumer, 40,                 // Missing explicit binding (may be implicit)
-        HasBinding, 35,                                // Binding detected (implies other components exist)
-        20
+        Signal == "LSASS_Access_with_Dump_File", 90,
+        Signal == "Known_Dump_Tool_Executed", 85,
+        Signal == "LSASS_CommandLine_Targeting" and IsCOMSvcsDump, 80,
+        Signal == "LSASS_CommandLine_Targeting", 70,
+        Signal == "LSASS_Access_Only" and IsLOLBin, 65,
+        Signal == "LSASS_Access_Only", 55,
+        50
     ),
-    
-    // Payload risk
-    PayloadRisk = case(
-        HasAnySuspiciousPayload == 1, 30,  // Suspicious command detected
-        isnotempty(tostring(Payloads[0])), 15,  // Has payload but not overtly suspicious
-        5
-    ),
-    
-    // Timing risk (rapid creation = automation/script)
-    TimingRisk = case(
-        TimeDeltaSeconds <= 10, 15,   // Created in 10 seconds
-        TimeDeltaSeconds <= 60, 10,   // Created in 1 minute
-        TimeDeltaSeconds <= 300, 5,   // Created in 5 minutes
-        0
-    ),
-    
-    // Process risk
-    ProcessRisk = case(
-        InitiatingProcesses has_any ("cmd.exe", "powershell.exe") and not(InitiatingProcesses has_any (LegitimateWMIProcesses)), 10,
-        InitiatingProcesses !has_any (LegitimateWMIProcesses), 5,
-        0
-    ),
-    
-    TotalRiskScore = BaseRisk + PayloadRisk + TimingRisk + ProcessRisk
-
+    RiskBonus = 
+        iff(IsLOLBin, 10, 0)
+        + iff(IsSuspiciousLocation, 10, 0)
+        + iff(HasLSASSInName, 10, 0)
+        + iff(AttackerAccount endswith "$", -15, 0)  // System account reduction
+        + iff(IsTaskManager, -30, 0)  // Task Manager gets lower score
+        + iff(IsCOMSvcsDump, 15, 0)
+        + iff(IsKnownTool, 15, 0)
+        + iff(AttackerParentProcess in~ ("winword.exe", "excel.exe", "outlook.exe", "chrome.exe"), 20, 0),
+    TotalRiskScore = BaseRisk + RiskBonus
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 80, "Critical",
-        TotalRiskScore >= 60, "High",
-        TotalRiskScore >= 40, "Medium",
+        TotalRiskScore >= 85, "Critical",
+        TotalRiskScore >= 70, "High",
+        TotalRiskScore >= 55, "Medium",
         "Low"
     )
-
-// Join with baseline for anomaly detection
-| join kind=leftouter (WMIBaseline) on DeviceName
-| extend
-    IsAnomalous = isnull(BaselineCount) or BaselineCount < 2,
-    AdjustedRiskScore = TotalRiskScore + iff(IsAnomalous, 15, 0)
-
-| extend
-    Evidence = pack(
-        "WMIComponents", WMIComponents,
-        "DetectionMethods", DetectionMethods,
-        "Payloads", Payloads,
-        "Namespaces", Namespaces,
-        "InitiatingProcesses", InitiatingProcesses,
-        "TimeDelta", TimeDeltaSeconds,
-        "ActivityCount", ActivityCount,
-        "IsAnomalous", IsAnomalous
-    ),
-    
-    ThreatContext = pack(
-        "PersistenceType", "WMI Event Subscription",
-        "Components", case(
-            IsCompleteSubscription, "Complete Subscription (Filter + Consumer + Binding)",
-            HasBinding, "Binding Detected (Complete Subscription Implied)",
-            "Partial Subscription"
-        ),
-        "Sophistication", case(
-            TimeDeltaSeconds <= 10, "High (Scripted/Automated)",
-            TimeDeltaSeconds <= 60, "Medium (Manual with Preparation)",
-            "Low (Manual)"
-        )
-    ),
-    
-    Recommendations = case(
-        AlertSeverity == "Critical",
-        "IMMEDIATE: 1) Isolate device 2) Check for active WMI subscriptions: Get-WmiObject -Namespace root\\subscription -Class __EventFilter/Consumer/Binding 3) Remove malicious subscriptions 4) Analyze payload for C2 indicators 5) Hunt for lateral movement",
-        AlertSeverity == "High",
-        "URGENT: 1) Validate WMI subscription legitimacy 2) Review payload for malicious intent 3) Check initiating user authorization 4) Enumerate all WMI subscriptions on device",
-        "INVESTIGATE: 1) Confirm business justification 2) Review WMI subscription details 3) Validate against approved monitoring/management tools"
-    ),
-    
-    DetectedTechniques = "T1546.003 (Event Triggered Execution: WMI Event Subscription), T1047 (Windows Management Instrumentation)"
-
-// Filter to actionable alerts
 | where AlertSeverity in ("Critical", "High", "Medium")
-
+| extend
+    Evidence = bag_pack(
+        "Signal", Signal,
+        "ProcessDetails", AttackerProcess,
+        "CommandLine", AttackerProcessCommandLine,
+        "ParentProcess", AttackerParentProcess,
+        "DumpFile", DumpFileName,
+        "DumpPath", DumpFilePath,
+        "FileSize", FileSize,
+        "IsLOLBin", IsLOLBin,
+        "IsSuspiciousLocation", IsSuspiciousLocation
+    ),
+    DetectedTechniques = "T1003.001 (OS Credential Dumping: LSASS Memory)",
+    RecommendedActions = case(
+        AlertSeverity == "Critical", "IMMEDIATE: Isolate device, reset credentials, investigate lateral movement",
+        AlertSeverity == "High", "Validate activity, check for credential theft indicators, review authentication logs",
+        "Review context and verify legitimacy"
+    )
 | project
-    TimeGenerated = LastActivity,
-    DeviceName,
-    AccountName,
-    AccountDomain,
+    TimeGenerated,
     AlertSeverity,
-    TotalRiskScore = AdjustedRiskScore,
-    ActivityWindowSeconds = TimeDeltaSeconds,
-    ThreatContext,
+    TotalRiskScore,
+    DeviceName,
+    AccountName = AttackerAccount,
+    AttackerProcess,
+    AttackerProcessCommandLine,
+    ParentProcess = AttackerParentProcess,
+    DumpFileName,
+    DumpFilePath,
+    FileCreator,
+    Signal,
     Evidence,
     DetectedTechniques,
-    Recommendations
-
+    RecommendedActions
 | sort by TotalRiskScore desc, TimeGenerated desc
 
 time_window: 4h
@@ -302,44 +240,48 @@ frequency: 15m
 trigger: results > 0
 
 fields_returned:
-  - LastActivity
-  - DeviceName
-  - AccountName
-  - AccountDomain
+  - TimeGenerated
   - AlertSeverity
-  - AdjustedRiskScore
-  - TimeDeltaSeconds
-  - ThreatContext
+  - TotalRiskScore
+  - DeviceName
+  - AttackerAccount
+  - AttackerProcess
+  - AttackerProcessCommandLine
+  - AttackerParentProcess
+  - DumpFileName
+  - DumpFilePath
+  - FileCreator
+  - Signal
   - Evidence
   - DetectedTechniques
-  - Recommendations
+  - RecommendedActions
 
 references:
-  - https://attack.mitre.org/techniques/T1546/003/
-  - https://attack.mitre.org/techniques/T1047/ 
-  - https://www.sans.org/blog/finding-evil-wmi-event-consumers-with-disk-forensics
-  - https://www.elastic.co/docs/reference/security/prebuilt-rules/rules/windows/persistence_via_windows_management_instrumentation_event_subscription
-  - https://www.cybertriage.com/blog/how-to-investigate-malware-wmi-event-consumers-2025/
+  - https://attack.mitre.org/techniques/T1003/001/
+  - https://github.com/Th1ru-M/Windows-Threat-Hunting/blob/master/Mimikatz%20Detection
+  - https://www.microsoft.com/en-us/security/blog/2022/10/05/detecting-and-preventing-lsass-credential-dumping-attacks/
+  - https://redcanary.com/threat-detection-report/techniques/lsass-memory/
+  - https://www.deepinstinct.com/blog/lsass-memory-dumps-are-stealthier-than-ever-before
+  - https://www.elastic.co/docs/reference/security/prebuilt-rules/rules/windows/credential_access_lsass_memdump_file_created
+  = https://jumpcloud.com/it-index/what-is-an-lsass-memory-dump
 
 triage: |
-  This alert means a hidden, fileless persistence mechanism has been successfully installed on the target device. The goal is to remove the WMI components and clean the payload.
+  This alert indicates that an attacker has attempted or succeeded in stealing credential material (NT hashes, Kerberos tickets) from the memory of the lsass.exe process.
     1.	Immediate Containment & Verification:
-      o	Isolate Device: Immediately isolate the DeviceName to prevent the payload from executing (if the trigger hasn't happened yet) or performing further hostile actions.
-      o	Verify Legitimacy: Review the InitiatingProcesses and AccountName. Check with the system owner or IT team if the user or process was authorized to install system management tools or run PowerShell with WMI commands at that time. If denied, proceed as a breach.
-    2.	WMI Artifact Discovery & Removal (Forensic):
-      o	Enumerate Subscriptions: If possible on the isolated device, run the following PowerShell commands to list the three components of the subscription:
-        •	Get-CimInstance -Namespace root\subscription -ClassName __EventFilter
-        •	Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer
-        • Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding
-      o	Identify Malicious Artifacts: Cross-reference the discovered Filter/Consumer/Binding names with the Payloads and InitiatingProcesses from the alert evidence.
-      o	Remove Subscription: Immediately delete the malicious objects using the appropriate command (e.g., Remove-CimInstance -InputObject $malicious_object). Deletion is the only way to remove the persistence.
-    3.	Payload and User Scoping:
-      o	Analyze Payload: Review the command line found in the Payloads field. If it contains encoded commands (-enc, IEX), decode them immediately to identify the final command, script, or C2 domain.
-      o	Check Initiator: Investigate the activity of the AccountName for the period leading up to the WMI creation. Look for preceding compromise events like credential access or initial access.
-      o	Review Execution Logs: Search process creation logs on the device for the execution of the command contained within the WMI ConsumerPayload (e.g., if the payload was powershell.exe -enc ..., look for that process execution).
-    4.	Escalation:
-      o	Escalate to the Incident Response (IR) team, confirming the discovery and removal of the stealthy T1546.003 persistence mechanism, and provide the identified payload command and initiating account name.
+      o	Isolate Device: Immediately isolate the DeviceName to prevent the attacker from exfiltrating the credential dump file or using the newly acquired credentials for lateral movement.
+      o	Verify Legitimacy: Review the AttackerProcess and AttackerProcessCommandLine. Check the AttackerAccount's activity. If the process is a known malicious tool or a highly suspicious LOLBin (e.g., PowerShell, rundll32.exe) and the user/system owner has no business reason for running it, proceed as a breach.
+    2.	Artifact Discovery and Collection:
+      o	Locate Dump File: Search the file system for the file path listed in DumpFilePath and DumpFileName. If found, collect the file for forensic analysis (to confirm contents and identify credential types) and then delete it from the endpoint.
+      o	Check LSASS Handles: Use live response tools (like Process Explorer) to check if any other active processes are holding an open handle to the lsass.exe process, which could indicate a continued active reading attempt.
+    3.	Compromised Credential Scoping:
+      o	Reset Credentials: The credentials and access tokens of every user currently logged into the infected machine at the time of the event are considered compromised. Force a password reset for every administrative and service account that was active on the system.
+      o	Review Session Logs: After containment, check the authentication and sign-in logs for the last 15-30 minutes for any suspicious logon attempts originating from the compromised host using any of the compromised accounts (a sign of immediate lateral movement).
+    4.	Process and Parent Analysis:
+      o	Parent Process: Investigate the ParentProcess (AttackerParentProcess). If it was a web browser, Office application, or an email client, this indicates the initial dropper/payload was delivered via phishing or a supply chain attack.
+      o	Exfiltration Check: Check network activity logs for the compromised endpoint for any immediate outbound connections to external IPs (C2 servers) around the TimeGenerated, which suggests the attacker exfiltrated the dump file.
+
+
 
 notes: |
-  - This detection is one of those that depends on LOLBAS so any FP tuning will need to be very deliberate.
+  - This detection is inteded to kill off all those duplicative mimikatz detections.  
 
