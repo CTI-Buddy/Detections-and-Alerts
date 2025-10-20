@@ -1,325 +1,305 @@
-# DE-HY25.11 Defense Evasion: Binary Masquerading Detection 
-id: DE-HY25.11
+# DE-HY25.12 Discovery: Excessive Local Enumeration Detection
+id: DE-HY25.12
 title: Defense Evasion: Binary Masquerading Detection 
 description: |
-  Detects binary masquerading by monitoring for system-named processes (e.g., svchost.exe) 
-  executed from suspicious paths, lacking valid signatures, or having anomalous parent processes
+  Detects a rapid execution spike of distinct local and domain enumeration 
+  commands by a single user/process, indicative of attacker reconnaissance.
 severity: High
 status: draft
 author: \m/
 date_created: 2025-10-20
 date_modified: 2025-10-20
 tags:
-  - clarifi_path: Endpoint/Windows/Defense_Evasion
-  - tactic: Defense Evasion
-  - tactic: Execution
-  - technique: Masquerading: Rename System Utility
-  - ATT&CK_ID: T1036.003 # Masquerading: Rename System Utility
-  - method: Correlation/Multi-Event
-  - method: Signature/String-Match
-  - core_indicator: Event_BinaryRename
-  - core_indicator: File_UnsignedBinary
-  - core_indicator: File_SuspiciousPath
+  - clarifi_path: Endpoint/Windows/Discovery
+  - tactic: Discovery
+  - technique: Account Discovery: Local Account
+  - technique: Account Discovery: Domain Account
+  - technique: Network Discovery
+  - technique: System Discovery
+  - technique: Process Discovery
+  - technique: Network Share Discovery
+  - technique: System Service Discovery
+  - technique: Scheduled Task Discovery
+  - technique: Domain Trust Discovery
+  - ATT&CK_ID: T1087.001 # Account Discovery: Local Account
+  - ATT&CK_ID: T1087.002 # Account Discovery: Domain Account
+  - ATT&CK_ID: T1016 # Network Discovery
+  - ATT&CK_ID: T1082 # System Discovery
+  - ATT&CK_ID: T1057 # Process Discovery
+  - ATT&CK_ID: T1135 # Network Share Discovery
+  - ATT&CK_ID: T1007 # System Service Discovery
+  - ATT&CK_ID: T1053 # Scheduled Task (Discovery)
+  - ATT&CK_ID: T1482 # Domain Trust Discovery
+  - method: Statistical/Frequency
+  - method: Threshold/Context-Aware
+  - core_indicator: Cmd_DiscoverySpike
+  - core_indicator: Event_EnumerationVolume
+  - core_indicator: Cmd_EnumerationBehavior
   - datasource: DeviceProcessEvents
-  - datasource: DeviceFileEvents
+
 
 logic:
   query: |
 
-// Defense Evasion: Binary Masquerading Detection 
-// Detects execution of renamed/copied high-risk binaries disguised as legitimate system processesds
+// Discovery: Excessive Local Enumeration Detection
+// Detects rapid execution of multiple discovery commands indicating reconnaissance activity
 
 // Configuration
-let LookbackWindow = 7d;
-let FileCreationWindow = 30d; // Look back further for file creation correlation
+let LookbackWindow = 2h;
+let CorrelationWindow = 90s; // SWAG number on slow enumeration - CAN BE ADJUTED!
+let DistinctCommandThreshold = 5; // Minimum distinct commands
+let RapidFireThreshold = 3s; // Commands within this window = very suspicious
 
-// High-Risk Utilities frequently renamed by attackers - this can also be edited!!
-let HighRiskBinaries = dynamic([
-    "powershell.exe", "pwsh.exe", "cmd.exe", "cscript.exe", "wscript.exe",
-    "certutil.exe", "bitsadmin.exe", "mshta.exe", "wmic.exe", "regsvr32.exe",
-    "rundll32.exe", "net.exe", "net1.exe", "findstr.exe", "vssadmin.exe",
-    "whoami.exe", "nltest.exe", "qprocess.exe", "tasklist.exe", "taskkill.exe",
-    "reg.exe", "sc.exe", "bcdedit.exe", "netsh.exe", "psexec.exe"
+// Known legitimate admin accounts/groups (CUSTOMIZE!!!!)
+let LegitimateAdminAccounts = dynamic([
+    "admin_service", "monitoring", "scom_action"
+    // Add your known admin accounts
 ]);
 
-// Known file hashes of legitimate Windows system binaries (PLEASE JUDICIOUSLY CUSTOMIZE THIS)
-// Build this table from baseline analysis of your Windows systems - identify trusted signatures and denote them here
-let LegitimateSystemHashes = datatable(FileName:string, LegitHash:string)
-[
-    // Example entries - populate with actual hashes - THIS IS CRITICAL AND REQUIRES A SCAN OR COORDINATION WITH OTHER STAKEHOLDERS
-    "svchost.exe", "YOUR_KNOWN_GOOD_HASH_1",
-    "explorer.exe", "YOUR_KNOWN_GOOD_HASH_2",
-    "services.exe", "YOUR_KNOWN_GOOD_HASH_3"
-    // Add more as needed from a baseline
-];
-
-// Benign system process names used for masquerading
-let BenignSystemNames = dynamic([
-    "svchost.exe", "explorer.exe", "services.exe", "csrss.exe",
-    "lsass.exe", "winlogon.exe", "spoolsv.exe", "dllhost.exe",
-    "taskmgr.exe", "conhost.exe", "audiodg.exe", "smss.exe",
-    "wininit.exe", "dwm.exe", "lsm.exe"
+// Legitimate scanning/management tools (CUSTOMIZE!!!!!!!)
+let LegitimateTools = dynamic([
+    "ConfigMgrClient", "SCCM", "LanSweeper", "PDQInventory",
+    "ManageEngine", "SolarWinds", "Nessus"
 ]);
 
-// Legitimate Windows system paths where these binaries belong
-let LegitimateSystemPaths = dynamic([
-    "\\windows\\system32\\",
-    "\\windows\\syswow64\\",
-    "\\windows\\winsxs\\"
+// Native Windows discovery commands
+let NativeDiscoveryCommands = dynamic([
+    "whoami.exe", "net.exe", "net1.exe", "systeminfo.exe", "tasklist.exe",
+    "query.exe", "quser.exe", "qprocess.exe", "qwinsta.exe",
+    "ipconfig.exe", "route.exe", "arp.exe", "netstat.exe", "nbtstat.exe",
+    "driverquery.exe", "sc.exe", "schtasks.exe", "at.exe",
+    "wevtutil.exe", "vssadmin.exe", "gpresult.exe", "gpupdate.exe",
+    "nltest.exe", "dsquery.exe", "csvde.exe", "ldifde.exe",
+    "wmic.exe", "reg.exe", "cmdkey.exe", "klist.exe"
 ]);
 
-// Suspicious file paths where attackers stage tools
-let SuspiciousFilePaths = dynamic([
-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-    "\\appdata\\roaming\\", "\\programdata\\",
-    "\\public\\", "\\users\\public\\", "\\downloads\\",
-    "\\perflogs\\", "\\$recycle.bin\\", "\\windows\\temp\\",
-    "\\inetpub\\", "\\wwwroot\\"
+// PowerShell discovery cmdlets (will extract from command line)
+let PowerShellDiscoveryCmdlets = dynamic([
+    "Get-LocalUser", "Get-LocalGroup", "Get-LocalGroupMember",
+    "Get-ADUser", "Get-ADGroup", "Get-ADComputer", "Get-ADDomain",
+    "Get-NetUser", "Get-NetGroup", "Get-NetComputer", "Get-NetShare",
+    "Get-NetSession", "Get-WmiObject", "Get-CimInstance",
+    "Get-Process", "Get-Service", "Get-ChildItem", "Get-ComputerInfo",
+    "Get-NetTCPConnection", "Get-NetIPAddress", "Get-DnsClientCache",
+    "Get-SmbShare", "Get-SmbMapping"
 ]);
 
-// --- Module 1: Hash Mismatch Detection (Highest Fidelity) ---
-// Detects system-named processes with non-standard hashes
-let HashMismatch = DeviceProcessEvents
+// Discovery-indicating command-line patterns
+let DiscoveryPatterns = dynamic([
+    "whoami", "net user", "net group", "net localgroup", "net accounts",
+    "net share", "net session", "net view", "net config", "net time",
+    "systeminfo", "ipconfig /all", "route print", "arp -a",
+    "netstat -ano", "tasklist /v", "sc query", "schtasks /query",
+    "quser", "qwinsta", "query user", "query session",
+    "nltest /domain", "nltest /dclist", "dsquery", "gpresult",
+    "wmic computersystem", "wmic useraccount", "wmic group",
+    "wmic share", "wmic process", "wmic service", "wmic nicconfig",
+    "reg query HKLM\\System", "reg query HKLM\\Software",
+    "dir c:\\users", "dir /s /b", "tree c:\\"
+]);
+
+// --- Main Detection: Process Execution Events ---
+let DiscoveryEvents = DeviceProcessEvents
 | where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (BenignSystemNames)
-| where isnotempty(SHA256)
-| extend ProcessPath = tolower(FolderPath)
-// Exclude legitimate system paths
-| where not(ProcessPath has_any (LegitimateSystemPaths))
+| where FileName has_any (NativeDiscoveryCommands)
+    or (FileName in~ ("powershell.exe", "pwsh.exe") and ProcessCommandLine has_any (PowerShellDiscoveryCmdlets))
+    or (FileName =~ "cmd.exe" and ProcessCommandLine has_any (DiscoveryPatterns))
 | extend
-    Signal = "System_Name_Wrong_Location",
+    CommandLine = ProcessCommandLine,
     AttackerAccount = AccountName,
     ParentProcess = InitiatingProcessFileName,
     ParentCommandLine = InitiatingProcessCommandLine,
-    ParentPath = InitiatingProcessFolderPath,
-    IsSuspiciousPath = ProcessPath has_any (SuspiciousFilePaths)
-| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
-          ProcessCommandLine, ProcessPath = FolderPath, SHA256, ParentProcess, ParentCommandLine,
-          ParentPath, IsSuspiciousPath, ProcessId = ProcessId;
-
-// --- Module 2: Unsigned System Binary Detection ---
-// Legitimate Windows system binaries are always signed by Microsoft
-let UnsignedSystemBinary = DeviceProcessEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (BenignSystemNames)
-| extend ProcessPath = tolower(FolderPath)
-// Exclude legitimate paths
-| where not(ProcessPath has_any (LegitimateSystemPaths))
+    ProcessPath = FolderPath
+// Exclude legitimate admin accounts and tools
+| where AttackerAccount !in~ (LegitimateAdminAccounts)
+| where ParentProcess !has_any (LegitimateTools)
 | extend
-    SignatureStatus = tostring(AdditionalFields.SignatureStatus),
-    SignerInfo = tostring(AdditionalFields.IssuerName)
-| where SignatureStatus !in ("Valid", "Trusted") 
-    or SignerInfo !contains "Microsoft"
-    or isempty(SignatureStatus)
-| extend
-    Signal = "Unsigned_System_Binary_Name",
-    AttackerAccount = AccountName,
-    ParentProcess = InitiatingProcessFileName,
-    IsSuspiciousPath = ProcessPath has_any (SuspiciousFilePaths)
-| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
-          ProcessCommandLine, ProcessPath = FolderPath, SHA256, SignatureStatus, SignerInfo,
-          ParentProcess, IsSuspiciousPath, ProcessId = ProcessId;
-
-// --- Module 3: Suspicious File Copy Operations ---
-// Detects copying high-risk tools to unusual locations with benign names
-let SuspiciousCopy = DeviceFileEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where ActionType in ("FileCreated", "FileModified")
-| where FileName has_any (BenignSystemNames)
-| extend FilePath = tolower(FolderPath)
-| where FilePath has_any (SuspiciousFilePaths)
-| extend
-    CopierProcess = InitiatingProcessFileName,
-    CopierCommandLine = InitiatingProcessCommandLine,
-    CopierAccount = AccountName,
-    FileCreationTime = TimeGenerated
-| project FileCreationTime, DeviceName, FileName, FilePath = FolderPath, SHA256,
-          CopierProcess, CopierCommandLine, CopierAccount, FileSize;
-
-// Correlate file copy with subsequent execution
-let CopyThenExecute = SuspiciousCopy
-| join kind=inner (
-    DeviceProcessEvents
-    | where TimeGenerated >= ago(LookbackWindow)
-    | project ExecutionTime = TimeGenerated, DeviceName, ProcessName = FileName,
-              ProcessCommandLine, ProcessPath = FolderPath, ExecutionSHA256 = SHA256,
-              ExecutionAccount = AccountName, ParentProcess = InitiatingProcessFileName
-) on DeviceName, $left.FileName == $right.ProcessName, $left.SHA256 == $right.ExecutionSHA256
-| where ExecutionTime >= FileCreationTime and ExecutionTime <= (FileCreationTime + 24h)
-| extend
-    Signal = "Suspicious_Copy_Then_Execute",
-    TimeDelta = datetime_diff('minute', ExecutionTime, FileCreationTime)
-| project TimeGenerated = ExecutionTime, DeviceName, Signal, AttackerAccount = ExecutionAccount,
-          ProcessName, ProcessCommandLine, ProcessPath, SHA256, CopierProcess, CopierCommandLine,
-          TimeDelta, ParentProcess;
-
-// --- Module 4: Parent Process Anomaly Detection ---
-// System processes should have specific parent processes
-let ParentProcessAnomalies = DeviceProcessEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (BenignSystemNames)
-| extend
-    ProcessPath = tolower(FolderPath),
-    ParentProcess = InitiatingProcessFileName,
-    ParentPath = tolower(InitiatingProcessFolderPath)
-// Exclude legitimate system paths
-| where not(ProcessPath has_any (LegitimateSystemPaths))
-| extend
-    // Flag unusual parent processes for system binaries
+    // Extract the actual discovery command being run
+    CoreCommand = case(
+        // For cmd.exe, extract the command after /c or /k
+        FileName =~ "cmd.exe", extract(@"(?:cmd(?:\.exe)?\s+/[ck]\s+)([^\s]+)", 1, CommandLine),
+        // For PowerShell, extract the cmdlet name
+        FileName in~ ("powershell.exe", "pwsh.exe"), extract(@"(Get-\w+|Invoke-\w+)", 1, CommandLine),
+        // For direct execution, use the filename
+        FileName
+    ),
+    // Determining the command category for better correlation... no touchy, this part is pretty distinct
+    CommandCategory = case(
+        ProcessCommandLine has_any ("whoami", "Get-LocalUser", "Get-ADUser", "net user", "net localgroup", "net group", "dsquery user"), "AccountDiscovery",
+        ProcessCommandLine has_any ("ipconfig", "netstat", "arp", "route", "nbtstat", "Get-NetTCPConnection", "Get-NetIPAddress"), "NetworkDiscovery",
+        ProcessCommandLine has_any ("systeminfo", "Get-ComputerInfo", "wmic computersystem", "Get-WmiObject", "Get-CimInstance"), "SystemDiscovery",
+        ProcessCommandLine has_any ("tasklist", "Get-Process", "wmic process", "qprocess"), "ProcessDiscovery",
+        ProcessCommandLine has_any ("net share", "net session", "net view", "Get-SmbShare"), "ShareDiscovery",
+        ProcessCommandLine has_any ("sc query", "Get-Service", "wmic service"), "ServiceDiscovery",
+        ProcessCommandLine has_any ("schtasks", "at.exe"), "ScheduledTaskDiscovery",
+        ProcessCommandLine has_any ("nltest", "Get-ADDomain", "gpresult"), "DomainDiscovery",
+        "GeneralDiscovery"
+    ),
+    // Flag suspicious parent processes (THESE CAN BE FURTHER BUILT OUT!!!!)
     HasSuspiciousParent = ParentProcess in~ (
-        "cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe",
-        "mshta.exe", "regsvr32.exe", "rundll32.exe", "excel.exe",
-        "winword.exe", "outlook.exe", "chrome.exe", "firefox.exe"
+        "winword.exe", "excel.exe", "outlook.exe", "powerpnt.exe",
+        "chrome.exe", "firefox.exe", "iexplore.exe", "msedge.exe",
+        "java.exe", "javaw.exe", "mshta.exe", "wscript.exe", "cscript.exe"
     ),
-    ParentInSuspiciousPath = ParentPath has_any (SuspiciousFilePaths),
-    IsSuspiciousPath = ProcessPath has_any (SuspiciousFilePaths)
-| where HasSuspiciousParent or ParentInSuspiciousPath
+    // Flag scripting wrappers
+    IsScriptWrapper = FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe")
 | extend
-    Signal = "Abnormal_Parent_Process",
-    AttackerAccount = AccountName,
-    ParentCommandLine = InitiatingProcessCommandLine
-| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
-          ProcessCommandLine, ProcessPath = FolderPath, ParentProcess, ParentCommandLine,
-          ParentPath = InitiatingProcessFolderPath, HasSuspiciousParent, IsSuspiciousPath;
+    // Create correlation key based on device, account, and parent process
+    SessionCorrelationKey = strcat(DeviceName, "_", AttackerAccount, "_", InitiatingProcessId),
+    TimeCorrelationKey = strcat(DeviceName, "_", AttackerAccount, "_", bin(TimeGenerated, CorrelationWindow));
 
-// --- Module 5: High-Risk Binary Renamed Detection ---
-// Detect when high-risk utilities are in suspicious paths (likely copied/renamed)
-let HighRiskInSuspiciousPath = DeviceProcessEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (HighRiskBinaries)
-| extend ProcessPath = tolower(FolderPath)
-| where ProcessPath has_any (SuspiciousFilePaths)
+// --- Aggregation and Correlation ---
+let AggregatedDiscovery = DiscoveryEvents
+| summarize
+    Commands = make_set(CoreCommand, 50),
+    Categories = make_set(CommandCategory),
+    CommandLines = make_list(CommandLine, 100),
+    TimeStamps = make_list(TimeGenerated),
+    TotalEvents = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    ParentProcesses = make_set(ParentProcess),
+    HasSuspiciousParent = max(toint(HasSuspiciousParent)),
+    IsScriptWrapper = max(toint(IsScriptWrapper))
+    by SessionCorrelationKey, DeviceName, AttackerAccount
 | extend
-    Signal = "High_Risk_Binary_Suspicious_Path",
-    AttackerAccount = AccountName,
-    ParentProcess = InitiatingProcessFileName,
-    ParentCommandLine = InitiatingProcessCommandLine
-| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
-          ProcessCommandLine, ProcessPath = FolderPath, SHA256, ParentProcess, ParentCommandLine;
+    DistinctCommandCount = array_length(Commands),
+    DistinctCategories = array_length(Categories),
+    TotalDurationSeconds = datetime_diff('second', LastSeen, FirstSeen),
+    AverageCommandInterval = iff(TotalEvents > 1, datetime_diff('second', LastSeen, FirstSeen) / (TotalEvents - 1), 0)
+| where DistinctCommandCount >= DistinctCommandThreshold;
 
-// --- Module 6: File Extension Mismatch ---
-// Detect executables with misleading extensions (e.g., svchost.txt that's actually an EXE)
-let ExtensionMismatch = DeviceFileEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where ActionType == "FileCreated"
-| extend FilePath = tolower(FolderPath)
-| where FilePath has_any (SuspiciousFilePaths)
-// File has benign extension but is executable
-| where (FileName endswith ".txt" or FileName endswith ".log" or FileName endswith ".dat")
-    and FileSize > 10000
-| extend
-    CreatorProcess = InitiatingProcessFileName,
-    CreatorCommandLine = InitiatingProcessCommandLine,
-    CreatorAccount = AccountName,
-    HasSystemName = FileName has_any (BenignSystemNames)
-| where HasSystemName or CreatorProcess has_any (HighRiskBinaries)
-| extend Signal = "Extension_Mismatch_Suspicious"
-| project TimeGenerated, DeviceName, Signal, FileName, FilePath = FolderPath, FileSize,
-          CreatorProcess, CreatorCommandLine, CreatorAccount = AccountName, SHA256;
+// --- Calculate Command Velocity (Rapid-Fire Detection) ---
+let VelocityAnalysis = DiscoveryEvents
+| order by DeviceName, AttackerAccount, TimeGenerated asc
+| extend PreviousTime = prev(TimeGenerated, 1)
+| extend TimeDelta = datetime_diff('second', TimeGenerated, PreviousTime)
+| where TimeDelta <= RapidFireThreshold and isnotnull(PreviousTime)
+| summarize RapidFireCount = count() by SessionCorrelationKey;
 
-// --- Consolidate All Detections ---
-let AllMasquerades = union isfuzzy=true
-    HashMismatch,
-    UnsignedSystemBinary,
-    CopyThenExecute,
-    ParentProcessAnomalies,
-    HighRiskInSuspiciousPath,
-    ExtensionMismatch
+// --- Combine Aggregation with Velocity Analysis ---
+AggregatedDiscovery
+| join kind=leftouter (VelocityAnalysis) on SessionCorrelationKey
+| extend RapidFireCount = coalesce(RapidFireCount, 0)
 | extend
-    IsSuspiciousPath = coalesce(IsSuspiciousPath, false),
-    HasSuspiciousParent = coalesce(HasSuspiciousParent, false);
-
-// --- Risk Scoring and Prioritization ---
-AllMasquerades
-| extend
-    BaseRisk = case(
-        Signal == "Unsigned_System_Binary_Name", 95,
-        Signal == "System_Name_Wrong_Location" and IsSuspiciousPath, 90,
-        Signal == "Suspicious_Copy_Then_Execute", 85,
-        Signal == "System_Name_Wrong_Location", 80,
-        Signal == "Abnormal_Parent_Process" and IsSuspiciousPath, 80,
-        Signal == "High_Risk_Binary_Suspicious_Path", 75,
-        Signal == "Abnormal_Parent_Process", 70,
-        Signal == "Extension_Mismatch_Suspicious", 65,
-        60
+    // Base risk scoring
+    VolumeRisk = case(
+        DistinctCommandCount >= 15, 40,
+        DistinctCommandCount >= 10, 30,
+        DistinctCommandCount >= 7, 20,
+        10
     ),
-    RiskBonus =
-        iff(IsSuspiciousPath, 10, 0)
-        + iff(HasSuspiciousParent, 10, 0)
-        + iff(ProcessName in~ ("svchost.exe", "lsass.exe", "csrss.exe"), 15, 0) // High-value targets
-        + iff(ProcessCommandLine has_any ("download", "invoke", "http", "encoded", "-enc"), 15, 0)
-        + iff(ParentProcess in~ ("powershell.exe", "cmd.exe", "wscript.exe"), 10, 0)
-        + iff(AttackerAccount endswith "$", -10, 0) // System accounts slightly less suspicious
-        + iff(CopierProcess in~ ("xcopy.exe", "copy.exe", "move.exe", "robocopy.exe"), 10, 0),
-    TotalRiskScore = BaseRisk + RiskBonus
+    CategoryDiversityRisk = case(
+        DistinctCategories >= 5, 20,  // Hitting many different discovery types
+        DistinctCategories >= 3, 10,
+        0
+    ),
+    VelocityRisk = case(
+        RapidFireCount >= 5, 20,  // Very rapid execution
+        RapidFireCount >= 2, 10,
+        AverageCommandInterval <= 5, 10,  // Average interval very short
+        0
+    ),
+    ContextRisk = case(
+        HasSuspiciousParent == 1, 30,  // Office app or browser spawning discovery
+        IsScriptWrapper == 1, 10,      // PowerShell/cmd wrapper
+        0
+    ),
+    TimePatternRisk = case(
+        hourofday(FirstSeen) >= 22 or hourofday(FirstSeen) <= 6, 10,  // Off-hours activity
+        0
+    ),
+    TotalRiskScore = VolumeRisk + CategoryDiversityRisk + VelocityRisk + ContextRisk + TimePatternRisk
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 90, "Critical",
-        TotalRiskScore >= 75, "High",
+        TotalRiskScore >= 80, "High",
         TotalRiskScore >= 60, "Medium",
         "Low"
     )
-| where AlertSeverity in ("Critical", "High", "Medium")
+| where AlertSeverity in ("High", "Medium")
 | extend
-    Evidence = bag_pack(
-        "Signal", Signal,
-        "ProcessName", coalesce(ProcessName, FileName),
-        "ProcessPath", coalesce(ProcessPath, FilePath),
-        "CommandLine", coalesce(ProcessCommandLine, CreatorCommandLine),
-        "ParentProcess", coalesce(ParentProcess, CopierProcess),
-        "ParentCommandLine", coalesce(ParentCommandLine, CopierCommandLine),
-        "FileHash", coalesce(SHA256, ""),
-        "SignatureStatus", coalesce(SignatureStatus, "N/A"),
-        "IsSuspiciousPath", IsSuspiciousPath,
-        "HasSuspiciousParent", HasSuspiciousParent
+    // Map to specific MITRE techniques based on categories detected
+    MITRETechniques = case(
+        Categories has "AccountDiscovery", "T1087.001 (Local Account Discovery), T1087.002 (Domain Account Discovery)",
+        Categories has "NetworkDiscovery", "T1016 (System Network Configuration Discovery)",
+        Categories has "SystemDiscovery", "T1082 (System Information Discovery)",
+        Categories has "ProcessDiscovery", "T1057 (Process Discovery)",
+        Categories has "ShareDiscovery", "T1135 (Network Share Discovery)",
+        Categories has "ServiceDiscovery", "T1007 (System Service Discovery)",
+        Categories has "ScheduledTaskDiscovery", "T1053 (Scheduled Task Discovery)",
+        Categories has "DomainDiscovery", "T1482 (Domain Trust Discovery)",
+        "Multiple Discovery Techniques"
     ),
-    DetectedTechniques = "T1036.003 (Masquerading: Rename System Utility)",
+    Evidence = bag_pack(
+        "DistinctCommands", DistinctCommandCount,
+        "CommandCategories", Categories,
+        "TotalExecutions", TotalEvents,
+        "DurationSeconds", TotalDurationSeconds,
+        "AverageInterval", AverageCommandInterval,
+        "RapidFireEvents", RapidFireCount,
+        "ParentProcesses", ParentProcesses,
+        "SampleCommands", array_slice(CommandLines, 0, 10),
+        "FirstCommand", FirstSeen,
+        "LastCommand", LastSeen
+    ),
     RecommendedActions = case(
-        AlertSeverity == "Critical", "IMMEDIATE: Isolate device, kill process, quarantine file, investigate lateral movement and credential access",
-        AlertSeverity == "High", "URGENT: Validate process legitimacy, check file signature, review parent process chain, investigate account activity",
-        "Review context, validate file hash against known good hashes, check for related suspicious activity"
+        AlertSeverity == "High", "URGENT: Investigate for reconnaissance activity. Check for follow-on lateral movement, credential access, or data exfiltration. Review account for compromise indicators.",
+        "Validate enumeration context. Check if activity aligns with legitimate admin tasks. Review for signs of automated scanning or attacker reconnaissance."
     )
 | project
-    TimeGenerated,
+    TimeGenerated = LastSeen,
     AlertSeverity,
     TotalRiskScore,
     DeviceName,
-    AccountName = coalesce(AttackerAccount, CreatorAccount),
-    ProcessName = coalesce(ProcessName, FileName),
-    ProcessPath = coalesce(ProcessPath, FilePath),
-    ProcessCommandLine = coalesce(ProcessCommandLine, CopierCommandLine),
-    ParentProcess = coalesce(ParentProcess, CopierProcess),
-    ParentCommandLine = coalesce(ParentCommandLine, ""),
-    FileHash = coalesce(SHA256, ""),
-    Signal,
+    AttackerAccount,
+    DistinctCommandCount,
+    DistinctCategories = array_length(Categories),
+    CommandCategories = Categories,
+    TotalEvents,
+    DurationSeconds = TotalDurationSeconds,
+    AverageIntervalSeconds = AverageCommandInterval,
+    RapidFireCount,
+    ParentProcesses,
     Evidence,
-    DetectedTechniques,
+    MITRETechniques,
     RecommendedActions
 | sort by TotalRiskScore desc, TimeGenerated desc
 
 references:
-  - https://attack.mitre.org/techniques/T1036/003/
-  - https://redcanary.com/threat-detection-report/techniques/rename-system-utilities/
-  - https://www.picussecurity.com/resource/masquerading
-  - https://help.fortinet.com/fsiem/Public_Resource_Access/7_1_0/rules/PH_RULE_Highly_Relevant_Renamed_Binary.htm
-  - https://lantern.splunk.com/Security/UCE/Guided_Insights/Threat_hunting/Detecting_masquerading
-  - https://research.splunk.com/stories/masquerading_-_rename_system_utilities/
+  - https://attack.mitre.org/techniques/T1087/
+  - https://attack.mitre.org/techniques/T1016/
+  - https://attack.mitre.org/techniques/T1082/
+  - https://attack.mitre.org/techniques/T1057/
+  - https://attack.mitre.org/techniques/T1135/
+  - https://attack.mitre.org/techniques/T1007/
+  - https://attack.mitre.org/techniques/T1053/
+  - https://attack.mitre.org/techniques/T1482/
+  - https://go.crowdstrike.com/rs/281-OBQ-266/images/2022OverWatchThreatHuntingReport.pdf
+  - https://www.cisa.gov/sites/default/files/2024-03/aa24-038a_csa_prc_state_sponsored_actors_compromise_us_critical_infrastructure_3.pdf
+  - https://telefonicatech.com/blog/snip3-investigacion-malware
+  - https://thedfirreport.com/2022/04/25/quantum-ransomware/
+  - https://cloud.google.com/blog/topics/threat-intelligence/fin13-cybercriminal-mexico/
 
 triage: |
-  This alert means a high-risk utility (like PowerShell or a dumping tool) is executing under a benign system name (like svchost.exe) from an unusual location.
-    1.	Immediate Containment & Process Termination:
-      o	Isolate Device: Immediately isolate the DeviceName to prevent the masqueraded process from executing its malicious payload, communicating with C2, or moving laterally.
-      o	Terminate Process: Using your EDR's live response capability, immediately terminate the process identified by the ProcessName and its associated ProcessId (if available) within the Evidence field.
-    2.	Artifact Discovery and Forensic Collection:
-      o	Locate Disguised File: Locate the file at the reported ProcessPath. If the analytic provided the original name (OldFileName in Module 1), record that. If not, record the masqueraded name.
-      o	Quarantine and Collect: Quarantine the file and collect it for forensic analysis. This file is the malicious payload.
-      o	Check File Hash/Signature: Verify the file's FileHash (SHA256) against public threat intelligence and against the list of LegitimateSystemHashes used in the analytic. If the file is unsigned and not a legitimate system hash, the compromise is confirmed.
-    3.	Process Chain and Persistence Analysis:
-      o	Analyze Parent Process: Review the ParentProcess and ParentCommandLine in the evidence. If the parent is suspicious (e.g., Office app, browser, or a script interpreter), investigate that parent process for signs of exploitation or dropping the malicious binary.
-      o	Persistence Check: Search the registry, WMI subscriptions, and startup folders on the device for any entry related to the ProcessName or ProcessPath to see if the attacker has established persistence using the disguised binary.
-    4.	Account Scoping and Remediation:
-      o	Investigate Initiator: Review all activity for the AccountName in the 30 minutes preceding the alert. Look for evidence of file download, execution of the original high-risk utility, or lateral movement attempts.
-      o	Escalate: If the masquerade is confirmed (unsigned, bad path, known malicious hash), immediately escalate, confirming a successful T1036.003 evasion and potential follow-on attack.
+  This alert means a user account or process is rapidly running many distinct system and network discovery commands, which is highly indicative of attacker reconnaissance (hands-on-keyboard).
+    1.	Immediate Containment & Validation:
+      o	Containment: Initiate a soft containment on the DeviceName and limit network connectivity (e.g., restrict outbound traffic) to prevent immediate lateral movement or C2 communication.
+      o	Verify Legitimacy: Review the AttackerAccount, the ParentProcesses, and the CommandCategories from the evidence.
+        •	Check Tools: Does this activity match any known, approved system administration, security, or inventory tools excluded in the analytic?
+        •	Check User: Contact the user or system owner. Were they running diagnostic scripts or troubleshooting? If the user denies the activity or the process originated from a suspicious parent (like a browser), proceed as a confirmed breach.
+    2.	Activity Scoping (What did they find?):
+      o	Review Command Lines: Scrutinize the full list of CommandLines provided in the evidence. Pay close attention to commands that attempt to extract credentials (e.g., cmdkey, klist) or find high-value targets (e.g., nltest /dclist, net group domain admins).
+      o	Analyze Follow-up Activity: Immediately search the logs for activity from the AttackerAccount on the DeviceName immediately following the discovery chain. Look for:
+        •	Execution of credential dumping tools (e.g., Mimikatz, Procdump).
+        •	Lateral movement attempts (e.g., psexec, RDP connection attempts to new hosts).
+        •	File staging or exfiltration (bitsadmin, certutil, creation of large compressed files).
+    3.	Account Remediation:
+      o	Reset Credentials: If the compromise is confirmed, force a password reset for the AttackerAccount and revoke all active sessions, as the attacker may have gained temporary access to the account.
+      o	Audit Permissions: If the compromised account is an Administrator or a high-value account, audit its recent administrative actions and group membership changes.
+    4.	Escalation:
+        o	Escalate, confirming the detection of the Discovery phase and providing the full list of information the attacker was attempting to gather.
+
+
 
 notes: |
-  - CRITICAL to understand that Module 1 may blow up if this rule is not aggressively built out/matured in 'high risk utilities' and 'known file hashes'
+  - Designed to knock out all those whoami, netstat and other associated enumeration alerts that have piled up.
