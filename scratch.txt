@@ -1,287 +1,325 @@
-# DE-HY25.10 Credential Access: LSASS Memory Dumping Detection
-id: DE-HY25.10
-title: Credential Access: LSASS Memory Dumping Detection
+# DE-HY25.11 Defense Evasion: Binary Masquerading Detection 
+id: DE-HY25.11
+title: Defense Evasion: Binary Masquerading Detection 
 description: |
-  Detects credential access attempts against the LSASS process memory, including known tools, 
-  command line targeting, and the creation of memory dump artifacts.
+  Detects binary masquerading by monitoring for system-named processes (e.g., svchost.exe) 
+  executed from suspicious paths, lacking valid signatures, or having anomalous parent processes
 severity: High
 status: draft
 author: \m/
-date_created: 2025-10-17
-date_modified: 2025-10-17
+date_created: 2025-10-20
+date_modified: 2025-10-20
 tags:
-  - clarifi_path: Windows/Endpoint/Credential_Access
-  - tactic: Credential Access
-  - technique: OS Credential Dumping: LSASS Memory
-  - ATT&CK_ID: T1003.001 # OS Credential Dumping: LSASS Memory
+  - clarifi_path: Endpoint/Windows/Defense_Evasion
+  - tactic: Defense Evasion
+  - tactic: Execution
+  - technique: Masquerading: Rename System Utility
+  - ATT&CK_ID: T1036.003 # Masquerading: Rename System Utility
   - method: Correlation/Multi-Event
   - method: Signature/String-Match
-  - core_indicator: Cmd_DumpTool
-  - core_indicator: File_MemoryDump
-  - core_indicator: Event_LSASS
+  - core_indicator: Event_BinaryRename
+  - core_indicator: File_UnsignedBinary
+  - core_indicator: File_SuspiciousPath
   - datasource: DeviceProcessEvents
-  - datasource: DeviceEvents
   - datasource: DeviceFileEvents
 
 logic:
   query: |
 
-// Credential Access: LSASS Memory Dumping Detection
-// Optimized for Microsoft Defender for Endpoint / Microsoft Sentinel
+// Defense Evasion: Binary Masquerading Detection 
+// Detects execution of renamed/copied high-risk binaries disguised as legitimate system processesds
 
 // Configuration
-let LookbackWindow = 2h;
-let CorrelationWindow = 30s;
+let LookbackWindow = 7d;
+let FileCreationWindow = 30d; // Look back further for file creation correlation
 
-// Known attack tools
-let LSASS_DumpTools = dynamic([
-    "mimikatz.exe", "lazagne.exe", "procdump.exe", "procdump64.exe", 
-    "dumpit.exe", "out-minidump.exe", "comsvcs.dll", "nanodump.exe",
-    "hashcat.exe", "fgdump.exe", "pwdump.exe", "gsecdump.exe"
+// High-Risk Utilities frequently renamed by attackers - this can also be edited!!
+let HighRiskBinaries = dynamic([
+    "powershell.exe", "pwsh.exe", "cmd.exe", "cscript.exe", "wscript.exe",
+    "certutil.exe", "bitsadmin.exe", "mshta.exe", "wmic.exe", "regsvr32.exe",
+    "rundll32.exe", "net.exe", "net1.exe", "findstr.exe", "vssadmin.exe",
+    "whoami.exe", "nltest.exe", "qprocess.exe", "tasklist.exe", "taskkill.exe",
+    "reg.exe", "sc.exe", "bcdedit.exe", "netsh.exe", "psexec.exe"
 ]);
 
-// Legitimate processes that may access LSASS
-let LegitimateProcesses = dynamic([
-    "MsMpEng.exe", "SenseIR.exe", "SenseCncProxy.exe", 
-    "HealthService.exe", "csrss.exe", "smss.exe",
-    "Microsoft.Identity.AadConnect.Health.AadSync.Host.exe"
+// Known file hashes of legitimate Windows system binaries (PLEASE JUDICIOUSLY CUSTOMIZE THIS)
+// Build this table from baseline analysis of your Windows systems - identify trusted signatures and denote them here
+let LegitimateSystemHashes = datatable(FileName:string, LegitHash:string)
+[
+    // Example entries - populate with actual hashes - THIS IS CRITICAL AND REQUIRES A SCAN OR COORDINATION WITH OTHER STAKEHOLDERS
+    "svchost.exe", "YOUR_KNOWN_GOOD_HASH_1",
+    "explorer.exe", "YOUR_KNOWN_GOOD_HASH_2",
+    "services.exe", "YOUR_KNOWN_GOOD_HASH_3"
+    // Add more as needed from a baseline
+];
+
+// Benign system process names used for masquerading
+let BenignSystemNames = dynamic([
+    "svchost.exe", "explorer.exe", "services.exe", "csrss.exe",
+    "lsass.exe", "winlogon.exe", "spoolsv.exe", "dllhost.exe",
+    "taskmgr.exe", "conhost.exe", "audiodg.exe", "smss.exe",
+    "wininit.exe", "dwm.exe", "lsm.exe"
 ]);
 
-// Common memory dump extensions
-let DumpFileExtensions = dynamic([".dmp", ".bin", ".log", ".mem", ".tmp", ".mdmp", ".hdmp"]);
+// Legitimate Windows system paths where these binaries belong
+let LegitimateSystemPaths = dynamic([
+    "\\windows\\system32\\",
+    "\\windows\\syswow64\\",
+    "\\windows\\winsxs\\"
+]);
 
-// --- Module 1: LSASS Process Access Detection ---
-let LSASS_Access = DeviceEvents
+// Suspicious file paths where attackers stage tools
+let SuspiciousFilePaths = dynamic([
+    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+    "\\appdata\\roaming\\", "\\programdata\\",
+    "\\public\\", "\\users\\public\\", "\\downloads\\",
+    "\\perflogs\\", "\\$recycle.bin\\", "\\windows\\temp\\",
+    "\\inetpub\\", "\\wwwroot\\"
+]);
+
+// --- Module 1: Hash Mismatch Detection (Highest Fidelity) ---
+// Detects system-named processes with non-standard hashes
+let HashMismatch = DeviceProcessEvents
 | where TimeGenerated >= ago(LookbackWindow)
-| where ActionType == "ProcessAccess"
-| where isnotempty(FileName)
+| where FileName has_any (BenignSystemNames)
+| where isnotempty(SHA256)
+| extend ProcessPath = tolower(FolderPath)
+// Exclude legitimate system paths
+| where not(ProcessPath has_any (LegitimateSystemPaths))
 | extend
-    TargetProcess = tostring(AdditionalFields.TargetFileName),
-    TargetProcessId = tostring(AdditionalFields.TargetProcessId),
-    AccessMask = tostring(AdditionalFields.AccessMask)
-| where TargetProcess =~ "lsass.exe"
-| extend
-    // Enhanced access mask detection for MDE
-    IsHighRiskAccess = AccessMask has_any (
-        "0x1010", "0x1410", "0x1438", "0x1400",
-        "0x1fffff", "0x1f0fff", "0x001FFFFF"
-    )
-| where IsHighRiskAccess
-| extend
-    AttackerProcess = FileName,
-    AttackerProcessId = ProcessId,
-    AttackerProcessCommandLine = ProcessCommandLine,
+    Signal = "System_Name_Wrong_Location",
     AttackerAccount = AccountName,
-    AttackerParentProcess = InitiatingProcessFileName,
-    AttackerParentCommandLine = InitiatingProcessCommandLine
-// Filter out known legitimate processes
-| where AttackerProcess !in~ (LegitimateProcesses)
-| extend
-    IsTaskManager = AttackerProcess =~ "taskmgr.exe",
-    IsLOLBin = AttackerProcess in~ ("cmd.exe", "powershell.exe", "rundll32.exe", "wscript.exe", "cscript.exe"),
-    LSASSAccessTime = TimeGenerated,
-    CorrelationKey = strcat(DeviceName, "_", AttackerProcessId)
-| project TimeGenerated, DeviceName, AttackerProcess, AttackerProcessCommandLine, AttackerAccount,
-          AttackerProcessId, AttackerParentProcess, TargetProcessId, AccessMask, IsTaskManager, IsLOLBin,
-          LSASSAccessTime, CorrelationKey, DeviceCorrelationKey = DeviceName;
+    ParentProcess = InitiatingProcessFileName,
+    ParentCommandLine = InitiatingProcessCommandLine,
+    ParentPath = InitiatingProcessFolderPath,
+    IsSuspiciousPath = ProcessPath has_any (SuspiciousFilePaths)
+| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
+          ProcessCommandLine, ProcessPath = FolderPath, SHA256, ParentProcess, ParentCommandLine,
+          ParentPath, IsSuspiciousPath, ProcessId = ProcessId;
 
-// --- Module 2: Credential Dumping Tool Execution ---
-let Tool_Execution = DeviceProcessEvents
+// --- Module 2: Unsigned System Binary Detection ---
+// Legitimate Windows system binaries are always signed by Microsoft
+let UnsignedSystemBinary = DeviceProcessEvents
 | where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (LSASS_DumpTools) 
-    or ProcessCommandLine has_any ("sekurlsa", "logonpasswords", "lsadump", "-ma lsass")
+| where FileName has_any (BenignSystemNames)
+| extend ProcessPath = tolower(FolderPath)
+// Exclude legitimate paths
+| where not(ProcessPath has_any (LegitimateSystemPaths))
 | extend
-    IsKnownTool = true,
-    AttackerAccount = AccountName,
-    AttackerParentProcess = InitiatingProcessFileName
-| project TimeGenerated, DeviceName, AttackerProcess = FileName, 
-          AttackerProcessCommandLine = ProcessCommandLine, AttackerAccount,
-          AttackerParentProcess, IsKnownTool, CorrelationKey = DeviceName;
-
-// --- Module 3: CommandLine-Based LSASS Targeting ---
-let CommandLine_Targeting = DeviceProcessEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where ProcessCommandLine has_any ("lsass.exe", "lsass.dmp", "-ma lsass", "comsvcs.dll", "MiniDump")
-    and ProcessCommandLine !has "Get-Process lsass"  // Exclude benign queries
+    SignatureStatus = tostring(AdditionalFields.SignatureStatus),
+    SignerInfo = tostring(AdditionalFields.IssuerName)
+| where SignatureStatus !in ("Valid", "Trusted") 
+    or SignerInfo !contains "Microsoft"
+    or isempty(SignatureStatus)
 | extend
+    Signal = "Unsigned_System_Binary_Name",
     AttackerAccount = AccountName,
-    AttackerParentProcess = InitiatingProcessFileName,
-    IsCOMSvcsDump = ProcessCommandLine has "comsvcs.dll" and ProcessCommandLine has "lsass"
-| project TimeGenerated, DeviceName, AttackerProcess = FileName, 
-          AttackerProcessCommandLine = ProcessCommandLine, AttackerAccount,
-          AttackerParentProcess, IsCOMSvcsDump, CorrelationKey = DeviceName;
+    ParentProcess = InitiatingProcessFileName,
+    IsSuspiciousPath = ProcessPath has_any (SuspiciousFilePaths)
+| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
+          ProcessCommandLine, ProcessPath = FolderPath, SHA256, SignatureStatus, SignerInfo,
+          ParentProcess, IsSuspiciousPath, ProcessId = ProcessId;
 
-// --- Module 4: Suspicious Memory Dump File Creation ---
-let Dump_File_Creation = DeviceFileEvents
+// --- Module 3: Suspicious File Copy Operations ---
+// Detects copying high-risk tools to unusual locations with benign names
+let SuspiciousCopy = DeviceFileEvents
 | where TimeGenerated >= ago(LookbackWindow)
 | where ActionType in ("FileCreated", "FileModified")
-| where isnotempty(FileName)
-| where (FileName has_any (DumpFileExtensions) and FileSize > 1000000)
-    or (FileName contains "lsass" and FileSize > 500000)
-    or (FolderPath has_any ("\\Temp\\", "\\AppData\\", "\\ProgramData\\", "\\Public\\") and FileSize > 40000000)
+| where FileName has_any (BenignSystemNames)
+| extend FilePath = tolower(FolderPath)
+| where FilePath has_any (SuspiciousFilePaths)
 | extend
-    IsMemoryDump = true,
-    DumpFileName = FileName,
-    DumpFilePath = FolderPath,
-    FileCreator = InitiatingProcessFileName,
-    FileCreatorCommandLine = InitiatingProcessCommandLine,
-    DumpFileCreationTime = TimeGenerated,
-    IsSuspiciousLocation = FolderPath has_any ("\\Temp\\", "\\AppData\\", "\\Public\\"),
-    HasLSASSInName = FileName contains "lsass",
-    CorrelationKey = DeviceName
-| project TimeGenerated, DeviceName, DumpFileName, DumpFilePath, FileCreator, FileCreatorCommandLine,
-          FileSize, DumpFileCreationTime, IsSuspiciousLocation, HasLSASSInName, CorrelationKey;
+    CopierProcess = InitiatingProcessFileName,
+    CopierCommandLine = InitiatingProcessCommandLine,
+    CopierAccount = AccountName,
+    FileCreationTime = TimeGenerated
+| project FileCreationTime, DeviceName, FileName, FilePath = FolderPath, SHA256,
+          CopierProcess, CopierCommandLine, CopierAccount, FileSize;
 
-// --- Correlation Layer ---
-// High-fidelity: LSASS Access + Dump File
-let Correlated_Access_Dump = LSASS_Access
-| join kind=inner (Dump_File_Creation) on DeviceCorrelationKey
-| where DumpFileCreationTime between (LSASSAccessTime .. (LSASSAccessTime + CorrelationWindow))
+// Correlate file copy with subsequent execution
+let CopyThenExecute = SuspiciousCopy
+| join kind=inner (
+    DeviceProcessEvents
+    | where TimeGenerated >= ago(LookbackWindow)
+    | project ExecutionTime = TimeGenerated, DeviceName, ProcessName = FileName,
+              ProcessCommandLine, ProcessPath = FolderPath, ExecutionSHA256 = SHA256,
+              ExecutionAccount = AccountName, ParentProcess = InitiatingProcessFileName
+) on DeviceName, $left.FileName == $right.ProcessName, $left.SHA256 == $right.ExecutionSHA256
+| where ExecutionTime >= FileCreationTime and ExecutionTime <= (FileCreationTime + 24h)
 | extend
-    Signal = "LSASS_Access_with_Dump_File",
-    TimeDelta = datetime_diff('second', DumpFileCreationTime, LSASSAccessTime)
-| project TimeGenerated = DumpFileCreationTime, DeviceName, AttackerProcess, AttackerProcessCommandLine,
-          AttackerAccount, AttackerParentProcess, AttackerProcessId, DumpFileName, DumpFilePath, 
-          FileCreator, FileSize, TimeDelta, Signal, IsTaskManager, IsLOLBin, 
-          IsSuspiciousLocation, HasLSASSInName;
+    Signal = "Suspicious_Copy_Then_Execute",
+    TimeDelta = datetime_diff('minute', ExecutionTime, FileCreationTime)
+| project TimeGenerated = ExecutionTime, DeviceName, Signal, AttackerAccount = ExecutionAccount,
+          ProcessName, ProcessCommandLine, ProcessPath, SHA256, CopierProcess, CopierCommandLine,
+          TimeDelta, ParentProcess;
 
-// Standalone LSASS Access (no correlated dump file)
-let Standalone_Access = LSASS_Access
-| join kind=leftanti (Dump_File_Creation) on DeviceCorrelationKey
-| extend Signal = "LSASS_Access_Only"
-| project TimeGenerated, DeviceName, AttackerProcess, AttackerProcessCommandLine,
-          AttackerAccount, AttackerParentProcess, Signal, IsTaskManager, IsLOLBin,
-          DumpFileName = "", DumpFilePath = "", FileCreator = "", FileSize = long(null),
-          IsSuspiciousLocation = false, HasLSASSInName = false;
+// --- Module 4: Parent Process Anomaly Detection ---
+// System processes should have specific parent processes
+let ParentProcessAnomalies = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where FileName has_any (BenignSystemNames)
+| extend
+    ProcessPath = tolower(FolderPath),
+    ParentProcess = InitiatingProcessFileName,
+    ParentPath = tolower(InitiatingProcessFolderPath)
+// Exclude legitimate system paths
+| where not(ProcessPath has_any (LegitimateSystemPaths))
+| extend
+    // Flag unusual parent processes for system binaries
+    HasSuspiciousParent = ParentProcess in~ (
+        "cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe",
+        "mshta.exe", "regsvr32.exe", "rundll32.exe", "excel.exe",
+        "winword.exe", "outlook.exe", "chrome.exe", "firefox.exe"
+    ),
+    ParentInSuspiciousPath = ParentPath has_any (SuspiciousFilePaths),
+    IsSuspiciousPath = ProcessPath has_any (SuspiciousFilePaths)
+| where HasSuspiciousParent or ParentInSuspiciousPath
+| extend
+    Signal = "Abnormal_Parent_Process",
+    AttackerAccount = AccountName,
+    ParentCommandLine = InitiatingProcessCommandLine
+| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
+          ProcessCommandLine, ProcessPath = FolderPath, ParentProcess, ParentCommandLine,
+          ParentPath = InitiatingProcessFolderPath, HasSuspiciousParent, IsSuspiciousPath;
+
+// --- Module 5: High-Risk Binary Renamed Detection ---
+// Detect when high-risk utilities are in suspicious paths (likely copied/renamed)
+let HighRiskInSuspiciousPath = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where FileName has_any (HighRiskBinaries)
+| extend ProcessPath = tolower(FolderPath)
+| where ProcessPath has_any (SuspiciousFilePaths)
+| extend
+    Signal = "High_Risk_Binary_Suspicious_Path",
+    AttackerAccount = AccountName,
+    ParentProcess = InitiatingProcessFileName,
+    ParentCommandLine = InitiatingProcessCommandLine
+| project TimeGenerated, DeviceName, Signal, AttackerAccount, ProcessName = FileName,
+          ProcessCommandLine, ProcessPath = FolderPath, SHA256, ParentProcess, ParentCommandLine;
+
+// --- Module 6: File Extension Mismatch ---
+// Detect executables with misleading extensions (e.g., svchost.txt that's actually an EXE)
+let ExtensionMismatch = DeviceFileEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ActionType == "FileCreated"
+| extend FilePath = tolower(FolderPath)
+| where FilePath has_any (SuspiciousFilePaths)
+// File has benign extension but is executable
+| where (FileName endswith ".txt" or FileName endswith ".log" or FileName endswith ".dat")
+    and FileSize > 10000
+| extend
+    CreatorProcess = InitiatingProcessFileName,
+    CreatorCommandLine = InitiatingProcessCommandLine,
+    CreatorAccount = AccountName,
+    HasSystemName = FileName has_any (BenignSystemNames)
+| where HasSystemName or CreatorProcess has_any (HighRiskBinaries)
+| extend Signal = "Extension_Mismatch_Suspicious"
+| project TimeGenerated, DeviceName, Signal, FileName, FilePath = FolderPath, FileSize,
+          CreatorProcess, CreatorCommandLine, CreatorAccount = AccountName, SHA256;
 
 // --- Consolidate All Detections ---
-let AllDetections = union
-    (Correlated_Access_Dump),
-    (Standalone_Access),
-    (Tool_Execution | extend Signal = "Known_Dump_Tool_Executed"),
-    (CommandLine_Targeting | extend Signal = "LSASS_CommandLine_Targeting")
+let AllMasquerades = union isfuzzy=true
+    HashMismatch,
+    UnsignedSystemBinary,
+    CopyThenExecute,
+    ParentProcessAnomalies,
+    HighRiskInSuspiciousPath,
+    ExtensionMismatch
 | extend
-    // Ensure all fields exist for scoring
-    IsTaskManager = coalesce(IsTaskManager, false),
-    IsLOLBin = coalesce(IsLOLBin, false),
-    IsSuspiciousLocation = coalesce(IsSuspiciousLocation, false),
-    HasLSASSInName = coalesce(HasLSASSInName, false),
-    IsCOMSvcsDump = coalesce(IsCOMSvcsDump, false),
-    IsKnownTool = coalesce(IsKnownTool, false);
+    IsSuspiciousPath = coalesce(IsSuspiciousPath, false),
+    HasSuspiciousParent = coalesce(HasSuspiciousParent, false);
 
 // --- Risk Scoring and Prioritization ---
-AllDetections
+AllMasquerades
 | extend
     BaseRisk = case(
-        Signal == "LSASS_Access_with_Dump_File", 90,
-        Signal == "Known_Dump_Tool_Executed", 85,
-        Signal == "LSASS_CommandLine_Targeting" and IsCOMSvcsDump, 80,
-        Signal == "LSASS_CommandLine_Targeting", 70,
-        Signal == "LSASS_Access_Only" and IsLOLBin, 65,
-        Signal == "LSASS_Access_Only", 55,
-        50
+        Signal == "Unsigned_System_Binary_Name", 95,
+        Signal == "System_Name_Wrong_Location" and IsSuspiciousPath, 90,
+        Signal == "Suspicious_Copy_Then_Execute", 85,
+        Signal == "System_Name_Wrong_Location", 80,
+        Signal == "Abnormal_Parent_Process" and IsSuspiciousPath, 80,
+        Signal == "High_Risk_Binary_Suspicious_Path", 75,
+        Signal == "Abnormal_Parent_Process", 70,
+        Signal == "Extension_Mismatch_Suspicious", 65,
+        60
     ),
-    RiskBonus = 
-        iff(IsLOLBin, 10, 0)
-        + iff(IsSuspiciousLocation, 10, 0)
-        + iff(HasLSASSInName, 10, 0)
-        + iff(AttackerAccount endswith "$", -15, 0)  // System account reduction
-        + iff(IsTaskManager, -30, 0)  // Task Manager gets lower score
-        + iff(IsCOMSvcsDump, 15, 0)
-        + iff(IsKnownTool, 15, 0)
-        + iff(AttackerParentProcess in~ ("winword.exe", "excel.exe", "outlook.exe", "chrome.exe"), 20, 0),
+    RiskBonus =
+        iff(IsSuspiciousPath, 10, 0)
+        + iff(HasSuspiciousParent, 10, 0)
+        + iff(ProcessName in~ ("svchost.exe", "lsass.exe", "csrss.exe"), 15, 0) // High-value targets
+        + iff(ProcessCommandLine has_any ("download", "invoke", "http", "encoded", "-enc"), 15, 0)
+        + iff(ParentProcess in~ ("powershell.exe", "cmd.exe", "wscript.exe"), 10, 0)
+        + iff(AttackerAccount endswith "$", -10, 0) // System accounts slightly less suspicious
+        + iff(CopierProcess in~ ("xcopy.exe", "copy.exe", "move.exe", "robocopy.exe"), 10, 0),
     TotalRiskScore = BaseRisk + RiskBonus
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 85, "Critical",
-        TotalRiskScore >= 70, "High",
-        TotalRiskScore >= 55, "Medium",
+        TotalRiskScore >= 90, "Critical",
+        TotalRiskScore >= 75, "High",
+        TotalRiskScore >= 60, "Medium",
         "Low"
     )
 | where AlertSeverity in ("Critical", "High", "Medium")
 | extend
     Evidence = bag_pack(
         "Signal", Signal,
-        "ProcessDetails", AttackerProcess,
-        "CommandLine", AttackerProcessCommandLine,
-        "ParentProcess", AttackerParentProcess,
-        "DumpFile", DumpFileName,
-        "DumpPath", DumpFilePath,
-        "FileSize", FileSize,
-        "IsLOLBin", IsLOLBin,
-        "IsSuspiciousLocation", IsSuspiciousLocation
+        "ProcessName", coalesce(ProcessName, FileName),
+        "ProcessPath", coalesce(ProcessPath, FilePath),
+        "CommandLine", coalesce(ProcessCommandLine, CreatorCommandLine),
+        "ParentProcess", coalesce(ParentProcess, CopierProcess),
+        "ParentCommandLine", coalesce(ParentCommandLine, CopierCommandLine),
+        "FileHash", coalesce(SHA256, ""),
+        "SignatureStatus", coalesce(SignatureStatus, "N/A"),
+        "IsSuspiciousPath", IsSuspiciousPath,
+        "HasSuspiciousParent", HasSuspiciousParent
     ),
-    DetectedTechniques = "T1003.001 (OS Credential Dumping: LSASS Memory)",
+    DetectedTechniques = "T1036.003 (Masquerading: Rename System Utility)",
     RecommendedActions = case(
-        AlertSeverity == "Critical", "IMMEDIATE: Isolate device, reset credentials, investigate lateral movement",
-        AlertSeverity == "High", "Validate activity, check for credential theft indicators, review authentication logs",
-        "Review context and verify legitimacy"
+        AlertSeverity == "Critical", "IMMEDIATE: Isolate device, kill process, quarantine file, investigate lateral movement and credential access",
+        AlertSeverity == "High", "URGENT: Validate process legitimacy, check file signature, review parent process chain, investigate account activity",
+        "Review context, validate file hash against known good hashes, check for related suspicious activity"
     )
 | project
     TimeGenerated,
     AlertSeverity,
     TotalRiskScore,
     DeviceName,
-    AccountName = AttackerAccount,
-    AttackerProcess,
-    AttackerProcessCommandLine,
-    ParentProcess = AttackerParentProcess,
-    DumpFileName,
-    DumpFilePath,
-    FileCreator,
+    AccountName = coalesce(AttackerAccount, CreatorAccount),
+    ProcessName = coalesce(ProcessName, FileName),
+    ProcessPath = coalesce(ProcessPath, FilePath),
+    ProcessCommandLine = coalesce(ProcessCommandLine, CopierCommandLine),
+    ParentProcess = coalesce(ParentProcess, CopierProcess),
+    ParentCommandLine = coalesce(ParentCommandLine, ""),
+    FileHash = coalesce(SHA256, ""),
     Signal,
     Evidence,
     DetectedTechniques,
     RecommendedActions
 | sort by TotalRiskScore desc, TimeGenerated desc
 
-time_window: 4h
-frequency: 15m
-trigger: results > 0
-
-fields_returned:
-  - TimeGenerated
-  - AlertSeverity
-  - TotalRiskScore
-  - DeviceName
-  - AttackerAccount
-  - AttackerProcess
-  - AttackerProcessCommandLine
-  - AttackerParentProcess
-  - DumpFileName
-  - DumpFilePath
-  - FileCreator
-  - Signal
-  - Evidence
-  - DetectedTechniques
-  - RecommendedActions
-
 references:
-  - https://attack.mitre.org/techniques/T1003/001/
-  - https://github.com/Th1ru-M/Windows-Threat-Hunting/blob/master/Mimikatz%20Detection
-  - https://www.microsoft.com/en-us/security/blog/2022/10/05/detecting-and-preventing-lsass-credential-dumping-attacks/
-  - https://redcanary.com/threat-detection-report/techniques/lsass-memory/
-  - https://www.deepinstinct.com/blog/lsass-memory-dumps-are-stealthier-than-ever-before
-  - https://www.elastic.co/docs/reference/security/prebuilt-rules/rules/windows/credential_access_lsass_memdump_file_created
-  = https://jumpcloud.com/it-index/what-is-an-lsass-memory-dump
+  - https://attack.mitre.org/techniques/T1036/003/
+  - https://redcanary.com/threat-detection-report/techniques/rename-system-utilities/
+  - https://www.picussecurity.com/resource/masquerading
+  - https://help.fortinet.com/fsiem/Public_Resource_Access/7_1_0/rules/PH_RULE_Highly_Relevant_Renamed_Binary.htm
+  - https://lantern.splunk.com/Security/UCE/Guided_Insights/Threat_hunting/Detecting_masquerading
+  - https://research.splunk.com/stories/masquerading_-_rename_system_utilities/
 
 triage: |
-  This alert indicates that an attacker has attempted or succeeded in stealing credential material (NT hashes, Kerberos tickets) from the memory of the lsass.exe process.
-    1.	Immediate Containment & Verification:
-      o	Isolate Device: Immediately isolate the DeviceName to prevent the attacker from exfiltrating the credential dump file or using the newly acquired credentials for lateral movement.
-      o	Verify Legitimacy: Review the AttackerProcess and AttackerProcessCommandLine. Check the AttackerAccount's activity. If the process is a known malicious tool or a highly suspicious LOLBin (e.g., PowerShell, rundll32.exe) and the user/system owner has no business reason for running it, proceed as a breach.
-    2.	Artifact Discovery and Collection:
-      o	Locate Dump File: Search the file system for the file path listed in DumpFilePath and DumpFileName. If found, collect the file for forensic analysis (to confirm contents and identify credential types) and then delete it from the endpoint.
-      o	Check LSASS Handles: Use live response tools (like Process Explorer) to check if any other active processes are holding an open handle to the lsass.exe process, which could indicate a continued active reading attempt.
-    3.	Compromised Credential Scoping:
-      o	Reset Credentials: The credentials and access tokens of every user currently logged into the infected machine at the time of the event are considered compromised. Force a password reset for every administrative and service account that was active on the system.
-      o	Review Session Logs: After containment, check the authentication and sign-in logs for the last 15-30 minutes for any suspicious logon attempts originating from the compromised host using any of the compromised accounts (a sign of immediate lateral movement).
-    4.	Process and Parent Analysis:
-      o	Parent Process: Investigate the ParentProcess (AttackerParentProcess). If it was a web browser, Office application, or an email client, this indicates the initial dropper/payload was delivered via phishing or a supply chain attack.
-      o	Exfiltration Check: Check network activity logs for the compromised endpoint for any immediate outbound connections to external IPs (C2 servers) around the TimeGenerated, which suggests the attacker exfiltrated the dump file.
-
-
+  This alert means a high-risk utility (like PowerShell or a dumping tool) is executing under a benign system name (like svchost.exe) from an unusual location.
+    1.	Immediate Containment & Process Termination:
+      o	Isolate Device: Immediately isolate the DeviceName to prevent the masqueraded process from executing its malicious payload, communicating with C2, or moving laterally.
+      o	Terminate Process: Using your EDR's live response capability, immediately terminate the process identified by the ProcessName and its associated ProcessId (if available) within the Evidence field.
+    2.	Artifact Discovery and Forensic Collection:
+      o	Locate Disguised File: Locate the file at the reported ProcessPath. If the analytic provided the original name (OldFileName in Module 1), record that. If not, record the masqueraded name.
+      o	Quarantine and Collect: Quarantine the file and collect it for forensic analysis. This file is the malicious payload.
+      o	Check File Hash/Signature: Verify the file's FileHash (SHA256) against public threat intelligence and against the list of LegitimateSystemHashes used in the analytic. If the file is unsigned and not a legitimate system hash, the compromise is confirmed.
+    3.	Process Chain and Persistence Analysis:
+      o	Analyze Parent Process: Review the ParentProcess and ParentCommandLine in the evidence. If the parent is suspicious (e.g., Office app, browser, or a script interpreter), investigate that parent process for signs of exploitation or dropping the malicious binary.
+      o	Persistence Check: Search the registry, WMI subscriptions, and startup folders on the device for any entry related to the ProcessName or ProcessPath to see if the attacker has established persistence using the disguised binary.
+    4.	Account Scoping and Remediation:
+      o	Investigate Initiator: Review all activity for the AccountName in the 30 minutes preceding the alert. Look for evidence of file download, execution of the original high-risk utility, or lateral movement attempts.
+      o	Escalate: If the masquerade is confirmed (unsigned, bad path, known malicious hash), immediately escalate, confirming a successful T1036.003 evasion and potential follow-on attack.
 
 notes: |
-  - This detection is inteded to kill off all those duplicative mimikatz detections.  
-
+  - CRITICAL to understand that Module 1 may blow up if this rule is not aggressively built out/matured in 'high risk utilities' and 'known file hashes'
