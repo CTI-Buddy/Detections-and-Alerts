@@ -1,305 +1,373 @@
-# DE-HY25.12 Discovery: Excessive Local Enumeration Detection
-id: DE-HY25.12
-title: Defense Evasion: Binary Masquerading Detection 
+# DE-HY25.13 Suspicious Script Interpreter Execution Detection 
+id: DE-HY25.13
+title: Suspicious Script Interpreter Execution Detection 
 description: |
-  Detects a rapid execution spike of distinct local and domain enumeration 
-  commands by a single user/process, indicative of attacker reconnaissance.
+  Detects suspicious execution of non-native script interpreters (Python, Node.js, Perl) 
+  originating from non-standard paths, using evasion techniques, or correlating with immediate 
+  C2/reconnaissance activity.
 severity: High
 status: draft
 author: \m/
-date_created: 2025-10-20
-date_modified: 2025-10-20
+date_created: 2025-10-21
+date_modified: 2025-10-21
 tags:
-  - clarifi_path: Endpoint/Windows/Discovery
-  - tactic: Discovery
-  - technique: Account Discovery: Local Account
-  - technique: Account Discovery: Domain Account
-  - technique: Network Discovery
-  - technique: System Discovery
-  - technique: Process Discovery
-  - technique: Network Share Discovery
-  - technique: System Service Discovery
-  - technique: Scheduled Task Discovery
-  - technique: Domain Trust Discovery
-  - ATT&CK_ID: T1087.001 # Account Discovery: Local Account
-  - ATT&CK_ID: T1087.002 # Account Discovery: Domain Account
-  - ATT&CK_ID: T1016 # Network Discovery
-  - ATT&CK_ID: T1082 # System Discovery
-  - ATT&CK_ID: T1057 # Process Discovery
-  - ATT&CK_ID: T1135 # Network Share Discovery
-  - ATT&CK_ID: T1007 # System Service Discovery
-  - ATT&CK_ID: T1053 # Scheduled Task (Discovery)
-  - ATT&CK_ID: T1482 # Domain Trust Discovery
-  - method: Statistical/Frequency
-  - method: Threshold/Context-Aware
-  - core_indicator: Cmd_DiscoverySpike
-  - core_indicator: Event_EnumerationVolume
-  - core_indicator: Cmd_EnumerationBehavior
+  - clarifi_path: Endpoint/Windows/Execution
+  - tactic: Execution
+  - technique: Command & Scripting Interpreter
+  - technique: Command & Scripting Interpreter: Python
+  - technique: Command & Scripting Interpreter: Node.js/JavaScript
+  - ATT&CK_ID: T1059 # Command & Scripting Interpreter
+  - ATT&CK_ID: T1059.006 # Command & Scripting Interpreter: Python
+  - ATT&CK_ID: T1059.007 # Command & Scripting Interpreter: Node.js/JavaScript
+  - method: Correlation/Sequence
+  - method: Signature/String-Match
+  - core_indicator: Event_ScriptInterpreter
+  - core_indicator: Net_C2Traffic
+  - core_indicator: File_SuspiciousPath
   - datasource: DeviceProcessEvents
+  - datasource: DeviceFileEvents
+  - datasource: DeviceNetworkEvents
 
 
 logic:
   query: |
 
-// Discovery: Excessive Local Enumeration Detection
-// Detects rapid execution of multiple discovery commands indicating reconnaissance activity
+// Execution: Suspicious Script Interpreter Execution Detection 
+// Detects malicious use of scripting language interpreters (Python, Node.js, Perl, Ruby, PHP)
 
 // Configuration
-let LookbackWindow = 2h;
-let CorrelationWindow = 90s; // SWAG number on slow enumeration - CAN BE ADJUTED!
-let DistinctCommandThreshold = 5; // Minimum distinct commands
-let RapidFireThreshold = 3s; // Commands within this window = very suspicious
+let LookbackWindow = 7d;
+let FileCreationWindow = 10m; // Recently dropped scripts
+let NetworkCorrelationWindow = 5m; // Network activity within this window
 
-// Known legitimate admin accounts/groups (CUSTOMIZE!!!!)
-let LegitimateAdminAccounts = dynamic([
-    "admin_service", "monitoring", "scom_action"
-    // Add your known admin accounts
+// Script Interpreters
+let ScriptInterpreters = dynamic([
+    "python.exe", "pythonw.exe", "py.exe", "python3.exe",
+    "perl.exe", "ruby.exe", "node.exe", "npm.exe", 
+    "php.exe", "php-cgi.exe"
 ]);
 
-// Legitimate scanning/management tools (CUSTOMIZE!!!!!!!)
-let LegitimateTools = dynamic([
-    "ConfigMgrClient", "SCCM", "LanSweeper", "PDQInventory",
-    "ManageEngine", "SolarWinds", "Nessus"
+// Legitimate installation paths (customize - this might get wonky in virtual envs)
+let LegitimateInterpreterPaths = dynamic([
+    "\\python\\", "\\python3", "\\python27\\", "\\python38\\", "\\python39\\", "\\python310\\",
+    "\\program files\\python", "\\program files (x86)\\python",
+    "\\program files\\nodejs\\", "\\program files (x86)\\nodejs\\",
+    "\\program files\\ruby\\", "\\program files (x86)\\ruby\\",
+    "\\program files\\perl\\", "\\programfiles\\strawberry\\perl\\",
+    "\\anaconda", "\\miniconda",
+    "\\microsoft visual studio\\", "\\visual studio code\\",
+    "\\pycharm\\", "\\jetbrains\\"
 ]);
 
-// Native Windows discovery commands
-let NativeDiscoveryCommands = dynamic([
-    "whoami.exe", "net.exe", "net1.exe", "systeminfo.exe", "tasklist.exe",
-    "query.exe", "quser.exe", "qprocess.exe", "qwinsta.exe",
-    "ipconfig.exe", "route.exe", "arp.exe", "netstat.exe", "nbtstat.exe",
-    "driverquery.exe", "sc.exe", "schtasks.exe", "at.exe",
-    "wevtutil.exe", "vssadmin.exe", "gpresult.exe", "gpupdate.exe",
-    "nltest.exe", "dsquery.exe", "csvde.exe", "ldifde.exe",
-    "wmic.exe", "reg.exe", "cmdkey.exe", "klist.exe"
+// Legitimate service/automation accounts (customize this!!!!!)
+let LegitimateServiceAccounts = dynamic([
+    "jenkins", "bamboo", "teamcity", "gitlab-runner",
+    "ansible", "puppet", "chef", "octopus"
+    // Add your automation/build accounts
 ]);
 
-// PowerShell discovery cmdlets (will extract from command line)
-let PowerShellDiscoveryCmdlets = dynamic([
-    "Get-LocalUser", "Get-LocalGroup", "Get-LocalGroupMember",
-    "Get-ADUser", "Get-ADGroup", "Get-ADComputer", "Get-ADDomain",
-    "Get-NetUser", "Get-NetGroup", "Get-NetComputer", "Get-NetShare",
-    "Get-NetSession", "Get-WmiObject", "Get-CimInstance",
-    "Get-Process", "Get-Service", "Get-ChildItem", "Get-ComputerInfo",
-    "Get-NetTCPConnection", "Get-NetIPAddress", "Get-DnsClientCache",
-    "Get-SmbShare", "Get-SmbMapping"
+// Suspicious execution paths
+let SuspiciousPaths = dynamic([
+    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+    "\\appdata\\roaming\\", "\\programdata\\",
+    "\\public\\", "\\users\\public\\", "\\downloads\\",
+    "\\perflogs\\", "\\windows\\temp\\", "\\windows\\tasks\\",
+    "\\$recycle.bin\\", "\\inetpub\\", "\\wwwroot\\",
+    "\\desktop\\", "\\documents\\", "\\music\\", "\\pictures\\", "\\videos\\"
 ]);
 
-// Discovery-indicating command-line patterns
-let DiscoveryPatterns = dynamic([
-    "whoami", "net user", "net group", "net localgroup", "net accounts",
-    "net share", "net session", "net view", "net config", "net time",
-    "systeminfo", "ipconfig /all", "route print", "arp -a",
-    "netstat -ano", "tasklist /v", "sc query", "schtasks /query",
-    "quser", "qwinsta", "query user", "query session",
-    "nltest /domain", "nltest /dclist", "dsquery", "gpresult",
-    "wmic computersystem", "wmic useraccount", "wmic group",
-    "wmic share", "wmic process", "wmic service", "wmic nicconfig",
-    "reg query HKLM\\System", "reg query HKLM\\Software",
-    "dir c:\\users", "dir /s /b", "tree c:\\"
+// High-confidence malicious patterns
+let HighConfidenceMaliciousPatterns = dynamic([
+    "import socket;", "import subprocess;", "import os;exec(",
+    "eval(compile(", "exec(compile(", "__import__('os')",
+    "pty.spawn", "SocketServer", "SimpleHTTPServer",
+    "reverse_tcp", "reverse_shell", "meterpreter", 
+    "shellcode", "payload", "exploit",
+    "CreateThread", "VirtualAlloc", "WriteProcessMemory",
+    "Invoke-Shellcode", "Invoke-Mimikatz", "powercat",
+    "Net.WebClient", "DownloadString", "DownloadFile",
+    "IEX(", "IEX (", "iex(", "iex ("
 ]);
 
-// --- Main Detection: Process Execution Events ---
-let DiscoveryEvents = DeviceProcessEvents
+// Suspicious but context-dependent patterns
+let SuspiciousPatterns = dynamic([
+    "-c ", "--command", "-e ", "--eval",
+    "exec(", "eval(", "compile(",
+    "base64.b64decode", "base64.decode", "binascii",
+    "urllib.request", "urllib2", "requests.get", "httplib",
+    "socket.socket", "socket.connect", "bind_tcp",
+    "subprocess.Popen", "subprocess.call", "os.system",
+    "CreateProcess", "WScript.Shell", "cmd.exe /c"
+]);
+
+// Suspicious imports/modules
+let SuspiciousModules = dynamic([
+    "ctypes", "pty", "tty", "msvcrt", "win32api", "win32con",
+    "pycryptodome", "cryptography.hazmat", "scapy"
+]);
+
+// --- Module 1: Script Interpreter Execution Analysis ---
+let InterpreterExecution = DeviceProcessEvents
 | where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (NativeDiscoveryCommands)
-    or (FileName in~ ("powershell.exe", "pwsh.exe") and ProcessCommandLine has_any (PowerShellDiscoveryCmdlets))
-    or (FileName =~ "cmd.exe" and ProcessCommandLine has_any (DiscoveryPatterns))
+| where FileName has_any (ScriptInterpreters)
 | extend
-    CommandLine = ProcessCommandLine,
     AttackerAccount = AccountName,
+    InterpreterName = FileName,
+    CommandLine = ProcessCommandLine,
     ParentProcess = InitiatingProcessFileName,
     ParentCommandLine = InitiatingProcessCommandLine,
-    ProcessPath = FolderPath
-// Exclude legitimate admin accounts and tools
-| where AttackerAccount !in~ (LegitimateAdminAccounts)
-| where ParentProcess !has_any (LegitimateTools)
+    ProcessPath = tolower(FolderPath),
+    ParentPath = tolower(InitiatingProcessFolderPath)
+// Exclude legitimate service accounts
+| where AttackerAccount !has_any (LegitimateServiceAccounts)
+// Exclude standard installation paths (but keep suspicious ones)
+| extend IsStandardPath = ProcessPath has_any (LegitimateInterpreterPaths)
 | extend
-    // Extract the actual discovery command being run
-    CoreCommand = case(
-        // For cmd.exe, extract the command after /c or /k
-        FileName =~ "cmd.exe", extract(@"(?:cmd(?:\.exe)?\s+/[ck]\s+)([^\s]+)", 1, CommandLine),
-        // For PowerShell, extract the cmdlet name
-        FileName in~ ("powershell.exe", "pwsh.exe"), extract(@"(Get-\w+|Invoke-\w+)", 1, CommandLine),
-        // For direct execution, use the filename
-        FileName
-    ),
-    // Determining the command category for better correlation... no touchy, this part is pretty distinct
-    CommandCategory = case(
-        ProcessCommandLine has_any ("whoami", "Get-LocalUser", "Get-ADUser", "net user", "net localgroup", "net group", "dsquery user"), "AccountDiscovery",
-        ProcessCommandLine has_any ("ipconfig", "netstat", "arp", "route", "nbtstat", "Get-NetTCPConnection", "Get-NetIPAddress"), "NetworkDiscovery",
-        ProcessCommandLine has_any ("systeminfo", "Get-ComputerInfo", "wmic computersystem", "Get-WmiObject", "Get-CimInstance"), "SystemDiscovery",
-        ProcessCommandLine has_any ("tasklist", "Get-Process", "wmic process", "qprocess"), "ProcessDiscovery",
-        ProcessCommandLine has_any ("net share", "net session", "net view", "Get-SmbShare"), "ShareDiscovery",
-        ProcessCommandLine has_any ("sc query", "Get-Service", "wmic service"), "ServiceDiscovery",
-        ProcessCommandLine has_any ("schtasks", "at.exe"), "ScheduledTaskDiscovery",
-        ProcessCommandLine has_any ("nltest", "Get-ADDomain", "gpresult"), "DomainDiscovery",
-        "GeneralDiscovery"
-    ),
-    // Flag suspicious parent processes (THESE CAN BE FURTHER BUILT OUT!!!!)
-    HasSuspiciousParent = ParentProcess in~ (
-        "winword.exe", "excel.exe", "outlook.exe", "powerpnt.exe",
-        "chrome.exe", "firefox.exe", "iexplore.exe", "msedge.exe",
-        "java.exe", "javaw.exe", "mshta.exe", "wscript.exe", "cscript.exe"
-    ),
-    // Flag scripting wrappers
-    IsScriptWrapper = FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe")
+    IsFromSuspiciousPath = ProcessPath has_any (SuspiciousPaths),
+    HasHighConfidenceMalicious = CommandLine has_any (HighConfidenceMaliciousPatterns),
+    HasSuspiciousPattern = CommandLine has_any (SuspiciousPatterns),
+    HasSuspiciousModule = CommandLine has_any (SuspiciousModules)
 | extend
-    // Create correlation key based on device, account, and parent process
-    SessionCorrelationKey = strcat(DeviceName, "_", AttackerAccount, "_", InitiatingProcessId),
-    TimeCorrelationKey = strcat(DeviceName, "_", AttackerAccount, "_", bin(TimeGenerated, CorrelationWindow));
+    // Parse command-line execution flags
+    HasInlineExecution = CommandLine has_any ("-c ", "--command", "-e ", "--eval", "/c ", "/e "),
+    HasBase64 = CommandLine has_any ("base64", "b64decode", "frombase64"),
+    HasNetworkIndicators = CommandLine has_any ("socket", "urllib", "requests", "http://", "https://", "ftp://", "tcp://"),
+    HasProcessCreation = CommandLine has_any ("subprocess", "Popen", "system(", "exec(", "CreateProcess", "WScript.Shell"),
+    HasFileOperations = CommandLine has_any ("open(", "read(", "write(", "os.remove", "shutil.rmtree")
+| extend
+    // Command line characteristics
+    CommandLength = strlen(CommandLine),
+    IsLongCommand = CommandLength > 500,
+    IsVeryLongCommand = CommandLength > 2000,
+    HasEncodedContent = CommandLine matches regex @"[A-Za-z0-9+/]{50,}={0,2}",
+    HasObfuscation = CommandLine has_any ("^", "^^", "chr(", "ord(", "\\x", "\\u", "%")
+| extend
+    // Parent process analysis
+    IsSuspiciousParent = ParentProcess in~ (
+        "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+        "acrord32.exe", "acrobat.exe", "foxit reader.exe",
+        "chrome.exe", "msedge.exe", "iexplore.exe", "firefox.exe",
+        "wscript.exe", "cscript.exe", "mshta.exe", "hta.exe",
+        "regsvr32.exe", "rundll32.exe", "odbcconf.exe"
+    ),
+    ParentIsCmdOrPowerShell = ParentProcess in~ ("cmd.exe", "powershell.exe", "pwsh.exe"),
+    ParentFromSuspiciousPath = ParentPath has_any (SuspiciousPaths)
+| extend
+    // User profile analysis
+    IsSystemAccount = AttackerAccount endswith "$",
+    IsAdminAccount = AttackerAccount has_any ("admin", "administrator"),
+    IsServiceAccount = AttackerAccount has_any ("service", "svc", "system")
+| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
+          ParentProcess, ParentCommandLine, ParentPath, SHA256, ProcessId,
+          IsStandardPath, IsFromSuspiciousPath, HasHighConfidenceMalicious, HasSuspiciousPattern,
+          HasSuspiciousModule, HasInlineExecution, HasBase64, HasNetworkIndicators,
+          HasProcessCreation, HasFileOperations, CommandLength, IsLongCommand, IsVeryLongCommand,
+          HasEncodedContent, HasObfuscation, IsSuspiciousParent, ParentIsCmdOrPowerShell,
+          ParentFromSuspiciousPath, IsSystemAccount, IsAdminAccount, IsServiceAccount;
 
-// --- Aggregation and Correlation ---
-let AggregatedDiscovery = DiscoveryEvents
+// --- Module 2: Script File Creation + Execution Correlation ---
+let RecentScriptFiles = DeviceFileEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where ActionType in ("FileCreated", "FileModified")
+| where FileName endswith ".py" or FileName endswith ".pl" or FileName endswith ".rb" 
+    or FileName endswith ".js" or FileName endswith ".php" or FileName endswith ".pyw"
+| extend FilePath = tolower(FolderPath)
+| where FilePath has_any (SuspiciousPaths)
+| extend
+    ScriptFileName = FileName,
+    ScriptCreationTime = TimeGenerated,
+    ScriptCreator = InitiatingProcessFileName,
+    ScriptCreatorAccount = AccountName
+| project ScriptCreationTime, DeviceName, ScriptFileName, ScriptFilePath = FolderPath,
+          ScriptCreator, ScriptCreatorAccount, ScriptSHA256 = SHA256;
+
+let ScriptCreationExecution = InterpreterExecution
+| join kind=inner (RecentScriptFiles) on DeviceName
+| where CommandLine contains ScriptFileName
+| where TimeGenerated between (ScriptCreationTime .. (ScriptCreationTime + FileCreationWindow))
+| extend
+    CreationToExecutionSeconds = datetime_diff('second', TimeGenerated, ScriptCreationTime),
+    Signal = "Script_Drop_and_Execute"
+| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
+          ParentProcess, ScriptFileName, ScriptFilePath, ScriptCreator, CreationToExecutionSeconds,
+          Signal, SHA256, HasHighConfidenceMalicious, HasSuspiciousPattern, IsFromSuspiciousPath;
+
+// --- Module 3: Network Activity Correlation ---  VERY CUSTOMIZABLE - WE SHOULD FURTHER BUILD OUT (ESP WITH THREAT INTEL ENRICHMENT)
+let InterpreterNetworkActivity = DeviceNetworkEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where InitiatingProcessFileName has_any (ScriptInterpreters)
+| where RemoteIPType in ("Public", "Loopback") or RemotePort in (4444, 4445, 8080, 8443, 443, 80)
+| extend
+    NetworkTime = TimeGenerated,
+    NetworkRemoteIP = RemoteIP,
+    NetworkRemotePort = RemotePort,
+    NetworkDirection = ActionType
 | summarize
-    Commands = make_set(CoreCommand, 50),
-    Categories = make_set(CommandCategory),
-    CommandLines = make_list(CommandLine, 100),
-    TimeStamps = make_list(TimeGenerated),
-    TotalEvents = count(),
-    FirstSeen = min(TimeGenerated),
-    LastSeen = max(TimeGenerated),
-    ParentProcesses = make_set(ParentProcess),
-    HasSuspiciousParent = max(toint(HasSuspiciousParent)),
-    IsScriptWrapper = max(toint(IsScriptWrapper))
-    by SessionCorrelationKey, DeviceName, AttackerAccount
-| extend
-    DistinctCommandCount = array_length(Commands),
-    DistinctCategories = array_length(Categories),
-    TotalDurationSeconds = datetime_diff('second', LastSeen, FirstSeen),
-    AverageCommandInterval = iff(TotalEvents > 1, datetime_diff('second', LastSeen, FirstSeen) / (TotalEvents - 1), 0)
-| where DistinctCommandCount >= DistinctCommandThreshold;
+    NetworkConnections = count(),
+    UniqueIPs = dcount(RemoteIP),
+    RemoteIPs = make_set(RemoteIP, 10),
+    RemotePorts = make_set(RemotePort),
+    FirstNetworkActivity = min(TimeGenerated)
+    by DeviceName, InitiatingProcessId, InitiatingProcessFileName;
 
-// --- Calculate Command Velocity (Rapid-Fire Detection) ---
-let VelocityAnalysis = DiscoveryEvents
-| order by DeviceName, AttackerAccount, TimeGenerated asc
-| extend PreviousTime = prev(TimeGenerated, 1)
-| extend TimeDelta = datetime_diff('second', TimeGenerated, PreviousTime)
-| where TimeDelta <= RapidFireThreshold and isnotnull(PreviousTime)
-| summarize RapidFireCount = count() by SessionCorrelationKey;
+let NetworkCorrelation = InterpreterExecution
+| join kind=inner (InterpreterNetworkActivity) 
+    on DeviceName, $left.ProcessId == $right.InitiatingProcessId
+| where abs(datetime_diff('second', TimeGenerated, FirstNetworkActivity)) <= NetworkCorrelationWindow
+| extend Signal = "Interpreter_with_Network_Activity"
+| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
+          ParentProcess, NetworkConnections, UniqueIPs, RemoteIPs, RemotePorts, Signal,
+          HasHighConfidenceMalicious, HasSuspiciousPattern, IsFromSuspiciousPath;
 
-// --- Combine Aggregation with Velocity Analysis ---
-AggregatedDiscovery
-| join kind=leftouter (VelocityAnalysis) on SessionCorrelationKey
-| extend RapidFireCount = coalesce(RapidFireCount, 0)
+// --- Module 4: Child Process Spawning ---
+let InterpreterChildProcesses = DeviceProcessEvents
+| where TimeGenerated >= ago(LookbackWindow)
+| where InitiatingProcessFileName has_any (ScriptInterpreters)
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "net.exe", "net1.exe",
+    "whoami.exe", "ipconfig.exe", "netstat.exe", "tasklist.exe",
+    "reg.exe", "wmic.exe", "vssadmin.exe", "wevtutil.exe"
+)
+| summarize
+    ChildProcesses = make_set(FileName),
+    ChildProcessCount = dcount(FileName),
+    ChildCommands = make_list(ProcessCommandLine, 20)
+    by DeviceName, InitiatingProcessId, InitiatingProcessFileName, InitiatingProcessAccountName;
+
+let ChildProcessCorrelation = InterpreterExecution
+| join kind=inner (InterpreterChildProcesses)
+    on DeviceName, $left.ProcessId == $right.InitiatingProcessId
+| extend Signal = "Interpreter_Spawning_Suspicious_Children"
+| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
+          ParentProcess, ChildProcesses, ChildProcessCount, ChildCommands, Signal,
+          HasHighConfidenceMalicious, HasSuspiciousPattern, IsFromSuspiciousPath;
+
+// --- Consolidate All Detections ---
+let StandaloneInterpreterAlerts = InterpreterExecution
+| where HasHighConfidenceMalicious
+    or (IsFromSuspiciousPath and not(IsStandardPath) and (HasSuspiciousPattern or HasInlineExecution))
+    or (IsSuspiciousParent and HasSuspiciousPattern)
+    or (IsVeryLongCommand and HasEncodedContent)
+    or (HasBase64 and HasNetworkIndicators and HasInlineExecution)
+| extend Signal = "Suspicious_Interpreter_Execution";
+
+let AllDetections = union isfuzzy=true
+    StandaloneInterpreterAlerts,
+    ScriptCreationExecution,
+    NetworkCorrelation,
+    ChildProcessCorrelation
 | extend
-    // Base risk scoring
-    VolumeRisk = case(
-        DistinctCommandCount >= 15, 40,
-        DistinctCommandCount >= 10, 30,
-        DistinctCommandCount >= 7, 20,
-        10
+    HasHighConfidenceMalicious = coalesce(HasHighConfidenceMalicious, false),
+    HasSuspiciousPattern = coalesce(HasSuspiciousPattern, false),
+    IsFromSuspiciousPath = coalesce(IsFromSuspiciousPath, false),
+    NetworkConnections = coalesce(NetworkConnections, 0),
+    ChildProcessCount = coalesce(ChildProcessCount, 0);
+
+// --- Risk Scoring ---
+AllDetections
+| extend
+    BaseRisk = case(
+        Signal == "Script_Drop_and_Execute", 85,
+        Signal == "Interpreter_with_Network_Activity", 90,
+        Signal == "Interpreter_Spawning_Suspicious_Children", 80,
+        Signal == "Suspicious_Interpreter_Execution" and HasHighConfidenceMalicious, 95,
+        Signal == "Suspicious_Interpreter_Execution", 70,
+        60
     ),
-    CategoryDiversityRisk = case(
-        DistinctCategories >= 5, 20,  // Hitting many different discovery types
-        DistinctCategories >= 3, 10,
-        0
-    ),
-    VelocityRisk = case(
-        RapidFireCount >= 5, 20,  // Very rapid execution
-        RapidFireCount >= 2, 10,
-        AverageCommandInterval <= 5, 10,  // Average interval very short
-        0
-    ),
-    ContextRisk = case(
-        HasSuspiciousParent == 1, 30,  // Office app or browser spawning discovery
-        IsScriptWrapper == 1, 10,      // PowerShell/cmd wrapper
-        0
-    ),
-    TimePatternRisk = case(
-        hourofday(FirstSeen) >= 22 or hourofday(FirstSeen) <= 6, 10,  // Off-hours activity
-        0
-    ),
-    TotalRiskScore = VolumeRisk + CategoryDiversityRisk + VelocityRisk + ContextRisk + TimePatternRisk
+    ContextBonus =
+        iff(HasHighConfidenceMalicious, 20, 0)
+        + iff(HasSuspiciousPattern and IsFromSuspiciousPath, 15, 0)
+        + iff(IsSuspiciousParent, 15, 0)
+        + iff(InterpreterName in~ ("perl.exe", "ruby.exe", "php.exe"), 10, 0)  // Less common = higher risk
+        + iff(HasInlineExecution and HasBase64, 15, 0)
+        + iff(HasEncodedContent, 10, 0)
+        + iff(ParentFromSuspiciousPath, 10, 0)
+        + iff(NetworkConnections > 0, 15, 0)
+        + iff(ChildProcessCount >= 3, 15, 0)
+        + iff(CreationToExecutionSeconds <= 60, 10, 0)  // Very quick execution after creation
+        + iff(hourofday(TimeGenerated) >= 22 or hourofday(TimeGenerated) <= 6, 5, 0),  // Off-hours
+    TotalRiskScore = BaseRisk + ContextBonus
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 80, "High",
+        TotalRiskScore >= 90, "Critical",
+        TotalRiskScore >= 75, "High",
         TotalRiskScore >= 60, "Medium",
         "Low"
     )
-| where AlertSeverity in ("High", "Medium")
+| where AlertSeverity in ("Critical", "High", "Medium")
 | extend
-    // Map to specific MITRE techniques based on categories detected
-    MITRETechniques = case(
-        Categories has "AccountDiscovery", "T1087.001 (Local Account Discovery), T1087.002 (Domain Account Discovery)",
-        Categories has "NetworkDiscovery", "T1016 (System Network Configuration Discovery)",
-        Categories has "SystemDiscovery", "T1082 (System Information Discovery)",
-        Categories has "ProcessDiscovery", "T1057 (Process Discovery)",
-        Categories has "ShareDiscovery", "T1135 (Network Share Discovery)",
-        Categories has "ServiceDiscovery", "T1007 (System Service Discovery)",
-        Categories has "ScheduledTaskDiscovery", "T1053 (Scheduled Task Discovery)",
-        Categories has "DomainDiscovery", "T1482 (Domain Trust Discovery)",
-        "Multiple Discovery Techniques"
-    ),
     Evidence = bag_pack(
-        "DistinctCommands", DistinctCommandCount,
-        "CommandCategories", Categories,
-        "TotalExecutions", TotalEvents,
-        "DurationSeconds", TotalDurationSeconds,
-        "AverageInterval", AverageCommandInterval,
-        "RapidFireEvents", RapidFireCount,
-        "ParentProcesses", ParentProcesses,
-        "SampleCommands", array_slice(CommandLines, 0, 10),
-        "FirstCommand", FirstSeen,
-        "LastCommand", LastSeen
+        "Signal", Signal,
+        "InterpreterPath", ProcessPath,
+        "CommandLine", CommandLine,
+        "ParentProcess", ParentProcess,
+        "ParentCommandLine", ParentCommandLine,
+        "HasHighConfidenceMalicious", HasHighConfidenceMalicious,
+        "HasSuspiciousPattern", HasSuspiciousPattern,
+        "IsFromSuspiciousPath", IsFromSuspiciousPath,
+        "NetworkConnections", NetworkConnections,
+        "RemoteIPs", RemoteIPs,
+        "ChildProcesses", ChildProcesses,
+        "ScriptFile", ScriptFileName,
+        "CreationToExecutionSeconds", CreationToExecutionSeconds
+    ),
+    MITRETechniques = case(
+        InterpreterName has "python", "T1059.006 (Python)",
+        InterpreterName has "node", "T1059.007 (JavaScript)",
+        InterpreterName has "perl", "T1059 (Command and Scripting Interpreter)",
+        InterpreterName has "ruby", "T1059 (Command and Scripting Interpreter)",
+        InterpreterName has "php", "T1059 (Command and Scripting Interpreter)",
+        "T1059 (Command and Scripting Interpreter)"
     ),
     RecommendedActions = case(
-        AlertSeverity == "High", "URGENT: Investigate for reconnaissance activity. Check for follow-on lateral movement, credential access, or data exfiltration. Review account for compromise indicators.",
-        "Validate enumeration context. Check if activity aligns with legitimate admin tasks. Review for signs of automated scanning or attacker reconnaissance."
+        AlertSeverity == "Critical", "IMMEDIATE: Isolate device, kill process tree, quarantine script file, investigate for C2 communication and lateral movement. Review account for compromise.",
+        AlertSeverity == "High", "URGENT: Validate script execution legitimacy, analyze script content, check network connections, review spawned processes. Investigate parent process chain.",
+        "Review script execution context, validate against approved automation, check for signs of malicious intent"
     )
 | project
-    TimeGenerated = LastSeen,
+    TimeGenerated,
     AlertSeverity,
     TotalRiskScore,
     DeviceName,
     AttackerAccount,
-    DistinctCommandCount,
-    DistinctCategories = array_length(Categories),
-    CommandCategories = Categories,
-    TotalEvents,
-    DurationSeconds = TotalDurationSeconds,
-    AverageIntervalSeconds = AverageCommandInterval,
-    RapidFireCount,
-    ParentProcesses,
+    InterpreterName,
+    ProcessPath,
+    ParentProcess,
+    CommandLine,
+    Signal,
+    NetworkConnections = coalesce(NetworkConnections, 0),
+    RemoteIPs = coalesce(RemoteIPs, dynamic([])),
+    ChildProcessCount = coalesce(ChildProcessCount, 0),
+    ChildProcesses = coalesce(ChildProcesses, dynamic([])),
     Evidence,
     MITRETechniques,
     RecommendedActions
 | sort by TotalRiskScore desc, TimeGenerated desc
 
 references:
-  - https://attack.mitre.org/techniques/T1087/
-  - https://attack.mitre.org/techniques/T1016/
-  - https://attack.mitre.org/techniques/T1082/
-  - https://attack.mitre.org/techniques/T1057/
-  - https://attack.mitre.org/techniques/T1135/
-  - https://attack.mitre.org/techniques/T1007/
-  - https://attack.mitre.org/techniques/T1053/
-  - https://attack.mitre.org/techniques/T1482/
-  - https://go.crowdstrike.com/rs/281-OBQ-266/images/2022OverWatchThreatHuntingReport.pdf
-  - https://www.cisa.gov/sites/default/files/2024-03/aa24-038a_csa_prc_state_sponsored_actors_compromise_us_critical_infrastructure_3.pdf
-  - https://telefonicatech.com/blog/snip3-investigacion-malware
-  - https://thedfirreport.com/2022/04/25/quantum-ransomware/
-  - https://cloud.google.com/blog/topics/threat-intelligence/fin13-cybercriminal-mexico/
+  - https://attack.mitre.org/techniques/T1059/
+  - https://attack.mitre.org/techniques/T1059/006/
+  - https://attack.mitre.org/techniques/T1059/007/
+  - https://www.volexity.com/blog/2021/08/24/north-korean-bluelight-special-inkysquid-deploys-rokrat/
+  - https://www.iranwatch.org/sites/default/files/public-intelligence-alert.pdf
+  - https://blog.talosintelligence.com/arcanedoor-new-espionage-focused-campaign-found-targeting-perimeter-network-devices/
+  - https://research.checkpoint.com/2020/bandook-signed-delivered/
+  - https://cloud.google.com/blog/topics/threat-intelligence/investigating-ivanti-zero-day-exploitation/
 
 triage: |
-  This alert means a user account or process is rapidly running many distinct system and network discovery commands, which is highly indicative of attacker reconnaissance (hands-on-keyboard).
-    1.	Immediate Containment & Validation:
-      o	Containment: Initiate a soft containment on the DeviceName and limit network connectivity (e.g., restrict outbound traffic) to prevent immediate lateral movement or C2 communication.
-      o	Verify Legitimacy: Review the AttackerAccount, the ParentProcesses, and the CommandCategories from the evidence.
-        •	Check Tools: Does this activity match any known, approved system administration, security, or inventory tools excluded in the analytic?
-        •	Check User: Contact the user or system owner. Were they running diagnostic scripts or troubleshooting? If the user denies the activity or the process originated from a suspicious parent (like a browser), proceed as a confirmed breach.
-    2.	Activity Scoping (What did they find?):
-      o	Review Command Lines: Scrutinize the full list of CommandLines provided in the evidence. Pay close attention to commands that attempt to extract credentials (e.g., cmdkey, klist) or find high-value targets (e.g., nltest /dclist, net group domain admins).
-      o	Analyze Follow-up Activity: Immediately search the logs for activity from the AttackerAccount on the DeviceName immediately following the discovery chain. Look for:
-        •	Execution of credential dumping tools (e.g., Mimikatz, Procdump).
-        •	Lateral movement attempts (e.g., psexec, RDP connection attempts to new hosts).
-        •	File staging or exfiltration (bitsadmin, certutil, creation of large compressed files).
-    3.	Account Remediation:
-      o	Reset Credentials: If the compromise is confirmed, force a password reset for the AttackerAccount and revoke all active sessions, as the attacker may have gained temporary access to the account.
-      o	Audit Permissions: If the compromised account is an Administrator or a high-value account, audit its recent administrative actions and group membership changes.
-    4.	Escalation:
-        o	Escalate, confirming the detection of the Discovery phase and providing the full list of information the attacker was attempting to gather.
-
+  This alert means an interpreter (Python, Node.js, etc.) is likely running malicious or heavily obfuscated code, potentially connecting to an attacker.
+    1. Immediate Containment & Process Termination
+      •	Isolate Device: Immediately isolate the DeviceName to prevent C2 communications, data exfiltration, and lateral movement.
+      •	Terminate Process Tree: Identify the ProcessId of the script interpreter (InterpreterName) and terminate the entire process tree. This stops the script and any malicious child processes it may have spawned (e.g., cmd.exe, powershell.exe).
+      •	Block Indicators: Review the RemoteIPs and RemotePorts from the evidence and immediately block these indicators at the firewall/perimeter level.
+    2. Forensic Artifact Collection
+      •	Locate and Analyze Script: If the Evidence includes a ScriptFile (ScriptFileName and ScriptFilePath), quarantine and collect the file. Analyze its contents immediately to determine its true function (e.g., reverse shell, keylogger, credential dumper).
+      •	Analyze Command Line: Review the CommandLine for encoded or embedded content. Attempt to decode the command (e.g., Base64 strings) to find the true instructions, URLs, C2 domains, or final payload.
+    3. Contextual Scoping & Follow-on Activity
+      •	Parent Process Review: Investigate the ParentProcess (e.g., browser, email client, Office app). This is the initial entry point. Review the parent application's activity just prior to the alert for signs of an exploit, drive-by download, or successful phishing attack.
+      •	Child Process Review: Review the ChildProcesses list. If it includes reconnaissance tools (whoami, netstat, wmic), the attacker is actively gaining intel. If it includes dumping tools or lateral movement binaries, escalate the containment scope immediately.
+      •	Account Remediation: The AttackerAccount is compromised. Force a password reset and investigate their login history for lateral movement attempts from new hosts.
 
 
 notes: |
-  - Designed to knock out all those whoami, netstat and other associated enumeration alerts that have piled up.
+  - Lots of opportunity to enrich in Module 3, esp if TA infrastructure tracking is a possible enrichment
