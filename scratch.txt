@@ -1,296 +1,320 @@
-# DE-HY25.13 Suspicious Script Interpreter Execution Detection 
-id: DE-HY25.13
-title: Suspicious Script Interpreter Execution Detection 
+# DE-HY25.14 Azure Security Center/Defender Modification Detection
+id: DE-HY25.14
+title: Azure Security Center/Defender Modification Detection
 description: |
-  Detects suspicious execution of non-native script interpreters (Python, Node.js, Perl) 
-  originating from non-standard paths, using evasion techniques, or correlating with immediate 
-  C2/reconnaissance activity.
+  Detects high-risk modifications, deletions, or disabling of critical Azure security controls 
+  (Defender, Audit Logs, Key Vault Protection) correlated with suspicious identity or velocity.
 severity: High
 status: draft
 author: \m/
-date_created: 2025-10-21
-date_modified: 2025-10-21
+date_created: 2025-10-22
+date_modified: 2025-10-22
 tags:
-  - clarifi_path: Endpoint/Windows/Execution
-  - tactic: Execution
-  - technique: Command & Scripting Interpreter
-  - technique: Command & Scripting Interpreter: Python
-  - technique: Command & Scripting Interpreter: Node.js/JavaScript
-  - ATT&CK_ID: T1059 # Command & Scripting Interpreter
-  - ATT&CK_ID: T1059.006 # Command & Scripting Interpreter: Python
-  - ATT&CK_ID: T1059.007 # Command & Scripting Interpreter: Node.js/JavaScript
+  - clarifi_path: Cloud/Azure-Activity/Defense_Evasion
+  - tactic: Defense Evasion
+  - tactic: Privilege Escalation
+  - technique: Impair Defenses: Disable or Modify System Controls 
+  - technique: Account Manipulation: Additional Cloud Credentials
+  - ATT&CK_ID: 	T1562.001 # Impair Defenses: Disable or Modify System Controls 
+  - ATT&CK_ID: T1098.001 # Account Manipulation: Additional Cloud Credentials
   - method: Correlation/Sequence
   - method: Signature/String-Match
-  - core_indicator: Event_ScriptInterpreter
-  - core_indicator: Net_C2Traffic
-  - core_indicator: File_SuspiciousPath
-  - datasource: DeviceProcessEvents
-  - datasource: DeviceFileEvents
-  - datasource: DeviceNetworkEvents
-
+  - method: Statistical/Frequency
+  - method: Threshold/Count-Limit
+  - core_indicator: Vol_API_Spike
+  - core_indicator: Event_SecurityDisable
+  - core_indicator: Access_SecurityCenter
+  - datasource: AzureActivity
+  - datasource: AuditLogs
 
 logic:
   query: |
 
-// Execution: Suspicious Script Interpreter Execution Detection 
-// Detects malicious use of scripting language interpreters (Python, Node.js, Perl, Ruby, PHP)
+// Defense Evasion: Azure Security Center/Defender Modification Detection
+// Detects disabling, deletion, or modification of critical security controls in Azure
 
 // Configuration
 let LookbackWindow = 7d;
-let FileCreationWindow = 10m; // Recently dropped scripts
-let NetworkCorrelationWindow = 5m; // Network activity within this window
+let CorrelationWindow = 30m; // Window for detecting blast radius attacks
+let VelocityWindow = 1h; // For detecting rapid security changes
 
-// Script Interpreters
-let ScriptInterpreters = dynamic([
-    "python.exe", "pythonw.exe", "py.exe", "python3.exe",
-    "perl.exe", "ruby.exe", "node.exe", "npm.exe", 
-    "php.exe", "php-cgi.exe"
+// Known legitimate automation identities (customize for your environment)
+let LegitimateAutomationAppIds = dynamic([
+    // "12345678-1234-1234-1234-123456789abc", // Azure DevOps Service Connection
+    // "87654321-4321-4321-4321-cba987654321"  // Terraform Cloud
 ]);
 
-// Legitimate installation paths (customize - this might get wonky in virtual envs)
-let LegitimateInterpreterPaths = dynamic([
-    "\\python\\", "\\python3", "\\python27\\", "\\python38\\", "\\python39\\", "\\python310\\",
-    "\\program files\\python", "\\program files (x86)\\python",
-    "\\program files\\nodejs\\", "\\program files (x86)\\nodejs\\",
-    "\\program files\\ruby\\", "\\program files (x86)\\ruby\\",
-    "\\program files\\perl\\", "\\programfiles\\strawberry\\perl\\",
-    "\\anaconda", "\\miniconda",
-    "\\microsoft visual studio\\", "\\visual studio code\\",
-    "\\pycharm\\", "\\jetbrains\\"
+let LegitimateAutomationNames = dynamic([
+    // "terraform-prod-automation",
+    // "azuredevops-pipeline",
+    // "github-actions-prod"
 ]);
 
-// Legitimate service/automation accounts (customize this!!!!!)
-let LegitimateServiceAccounts = dynamic([
-    "jenkins", "bamboo", "teamcity", "gitlab-runner",
-    "ansible", "puppet", "chef", "octopus"
-    // Add your automation/build accounts
+// Corporate/VPN IP ranges (CUSTOMIZE!!! This may be a little tough given sophisticated attackers will know to use MS IP ranges)
+let CorporateIPRanges = dynamic([
+    // "10.0.0.0/8",
+    // "172.16.0.0/12",
+    // "192.168.0.0/16"
 ]);
 
-// Suspicious execution paths
-let SuspiciousPaths = dynamic([
-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-    "\\appdata\\roaming\\", "\\programdata\\",
-    "\\public\\", "\\users\\public\\", "\\downloads\\",
-    "\\perflogs\\", "\\windows\\temp\\", "\\windows\\tasks\\",
-    "\\$recycle.bin\\", "\\inetpub\\", "\\wwwroot\\",
-    "\\desktop\\", "\\documents\\", "\\music\\", "\\pictures\\", "\\videos\\"
+// Critical production subscriptions (CUSTOMIZE OR REMOVE)
+let CriticalSubscriptions = dynamic([
+    // "prod-subscription-id-1",
+    // "prod-subscription-id-2"
 ]);
 
-// High-confidence malicious patterns
-let HighConfidenceMaliciousPatterns = dynamic([
-    "import socket;", "import subprocess;", "import os;exec(",
-    "eval(compile(", "exec(compile(", "__import__('os')",
-    "pty.spawn", "SocketServer", "SimpleHTTPServer",
-    "reverse_tcp", "reverse_shell", "meterpreter", 
-    "shellcode", "payload", "exploit",
-    "CreateThread", "VirtualAlloc", "WriteProcessMemory",
-    "Invoke-Shellcode", "Invoke-Mimikatz", "powercat",
-    "Net.WebClient", "DownloadString", "DownloadFile",
-    "IEX(", "IEX (", "iex(", "iex ("
+// High-risk security operations (PRICING MAY NOT APPLY HERE FOR OBVIOUS REASONS - BUT CHANGING TO FREE MAY STILL BE VALID TACTIC)
+let SecurityDisablingOperations = dynamic([
+    // Microsoft Defender for Cloud / Security Center
+    "Microsoft.Security/pricings/write",                    // Changing pricing tier (often to Free/disabled)
+    "Microsoft.Security/pricings/delete",
+    "Microsoft.Security/autoProvisioningSettings/write",    // Disabling auto-provisioning
+    "Microsoft.Security/securityContacts/delete",
+    "Microsoft.Security/securityContacts/write",
+    "Microsoft.Security/settings/write",
+    "Microsoft.Security/iotSecuritySolutions/delete",
+    "Microsoft.Security/assessments/write",                 // Modifying security assessments
+    "Microsoft.Security/automations/delete",                // Deleting security automation
+    
+    // Diagnostic Settings (Audit Log Evasion)
+    "Microsoft.Insights/diagnosticSettings/delete",
+    "Microsoft.Insights/diagnosticSettings/write",
+    
+    // Azure Monitor & Alerting
+    "Microsoft.Insights/activityLogAlerts/delete",
+    "Microsoft.Insights/scheduledQueryRules/delete",        // Deleting KQL alert rules
+    "Microsoft.Insights/actionGroups/delete",
+    "Microsoft.Insights/workbooks/delete",
+    
+    // Security Policies & Compliance
+    "Microsoft.Authorization/policyAssignments/delete",
+    "Microsoft.Authorization/policyAssignments/write",
+    "Microsoft.Authorization/policyExemptions/write",       // Creating policy exemptions
+    "Microsoft.Authorization/policyExemptions/delete",
+    
+    // Network Security
+    "Microsoft.Network/networkSecurityGroups/delete",
+    "Microsoft.Network/networkSecurityGroups/securityRules/delete",
+    "Microsoft.Network/azureFirewalls/delete",
+    "Microsoft.Network/firewallPolicies/delete",
+    
+    // Key Vault Security
+    "Microsoft.KeyVault/vaults/write",                      // Disabling soft delete/purge protection
+    "Microsoft.KeyVault/vaults/delete",
+    
+    // Storage Security
+    "Microsoft.Storage/storageAccounts/write",              // Disabling threat protection
+    "Microsoft.Storage/storageAccounts/blobServices/write",
+    
+    // Resource Protection
+    "Microsoft.Authorization/locks/delete",                 // Removing resource locks
+    
+    // Conditional Access (Entra ID/AAD)
+    "Microsoft.Authorization/roleAssignments/delete",
+    "Microsoft.Authorization/roleDefinitions/delete"
 ]);
 
-// Suspicious but context-dependent patterns
-let SuspiciousPatterns = dynamic([
-    "-c ", "--command", "-e ", "--eval",
-    "exec(", "eval(", "compile(",
-    "base64.b64decode", "base64.decode", "binascii",
-    "urllib.request", "urllib2", "requests.get", "httplib",
-    "socket.socket", "socket.connect", "bind_tcp",
-    "subprocess.Popen", "subprocess.call", "os.system",
-    "CreateProcess", "WScript.Shell", "cmd.exe /c"
-]);
-
-// Suspicious imports/modules
-let SuspiciousModules = dynamic([
-    "ctypes", "pty", "tty", "msvcrt", "win32api", "win32con",
-    "pycryptodome", "cryptography.hazmat", "scapy"
-]);
-
-// --- Module 1: Script Interpreter Execution Analysis ---
-let InterpreterExecution = DeviceProcessEvents
+// --- Module 1: Core Security Modification Detection ---
+let SecurityModifications = AzureActivity
 | where TimeGenerated >= ago(LookbackWindow)
-| where FileName has_any (ScriptInterpreters)
+| where OperationNameValue has_any (SecurityDisablingOperations)
+    or (OperationNameValue has "Microsoft.Security" and OperationNameValue has_any ("delete", "write"))
+    or (OperationNameValue has "Microsoft.Insights" and OperationNameValue has_any ("delete", "write"))
 | extend
-    AttackerAccount = AccountName,
-    InterpreterName = FileName,
-    CommandLine = ProcessCommandLine,
-    ParentProcess = InitiatingProcessFileName,
-    ParentCommandLine = InitiatingProcessCommandLine,
-    ProcessPath = tolower(FolderPath),
-    ParentPath = tolower(InitiatingProcessFolderPath)
-// Exclude legitimate service accounts
-| where AttackerAccount !has_any (LegitimateServiceAccounts)
-// Exclude standard installation paths (but keep suspicious ones)
-| extend IsStandardPath = ProcessPath has_any (LegitimateInterpreterPaths)
+    // Parse identity information
+    CallerObjectId = tostring(parse_json(tostring(Claims)).["http://schemas.microsoft.com/identity/claims/objectidentifier"]),
+    CallerUPN = tostring(parse_json(tostring(Claims)).upn),
+    CallerAppId = tostring(parse_json(tostring(Claims)).appid),
+    CallerAppDisplayName = tostring(parse_json(tostring(Claims)).appidacr),
+    CallerIdentityType = case(
+        isnotempty(parse_json(tostring(Claims)).appid), "ServicePrincipal",
+        isnotempty(parse_json(tostring(Claims)).upn), "User",
+        "ManagedIdentity"
+    )
 | extend
-    IsFromSuspiciousPath = ProcessPath has_any (SuspiciousPaths),
-    HasHighConfidenceMalicious = CommandLine has_any (HighConfidenceMaliciousPatterns),
-    HasSuspiciousPattern = CommandLine has_any (SuspiciousPatterns),
-    HasSuspiciousModule = CommandLine has_any (SuspiciousModules)
+    // Determine actual caller identity
+    CallerIdentity = coalesce(CallerUPN, CallerAppId, CallerObjectId, Caller),
+    OperationCategory = case(
+        OperationNameValue has "pricings", "DefenderPlanChange",
+        OperationNameValue has "diagnosticSettings", "AuditLogModification",
+        OperationNameValue has "policyAssignments", "PolicyChange",
+        OperationNameValue has "policyExemptions", "PolicyExemption",
+        OperationNameValue has "activityLogAlerts", "AlertDeletion",
+        OperationNameValue has "networkSecurityGroups", "NetworkSecurityChange",
+        OperationNameValue has "locks", "ResourceLockRemoval",
+        OperationNameValue has "KeyVault", "KeyVaultSecurityChange",
+        "OtherSecurityChange"
+    )
+| where ActivityStatusValue in ("Success", "Succeeded", "Accepted")
 | extend
-    // Parse command-line execution flags
-    HasInlineExecution = CommandLine has_any ("-c ", "--command", "-e ", "--eval", "/c ", "/e "),
-    HasBase64 = CommandLine has_any ("base64", "b64decode", "frombase64"),
-    HasNetworkIndicators = CommandLine has_any ("socket", "urllib", "requests", "http://", "https://", "ftp://", "tcp://"),
-    HasProcessCreation = CommandLine has_any ("subprocess", "Popen", "system(", "exec(", "CreateProcess", "WScript.Shell"),
-    HasFileOperations = CommandLine has_any ("open(", "read(", "write(", "os.remove", "shutil.rmtree")
+    SourceIP = CallerIpAddress,
+    SubscriptionId = tostring(split(_SubscriptionId, "/")[-1]),
+    ResourceGroupName = tostring(split(_ResourceId, "/")[4]),
+    ResourceName = tostring(split(_ResourceId, "/")[-1]),
+    IsCriticalSubscription = SubscriptionId in~ (CriticalSubscriptions)
 | extend
-    // Command line characteristics
-    CommandLength = strlen(CommandLine),
-    IsLongCommand = CommandLength > 500,
-    IsVeryLongCommand = CommandLength > 2000,
-    HasEncodedContent = CommandLine matches regex @"[A-Za-z0-9+/]{50,}={0,2}",
-    HasObfuscation = CommandLine has_any ("^", "^^", "chr(", "ord(", "\\x", "\\u", "%")
+    // Check if identity is whitelisted
+    IsWhitelistedIdentity = CallerAppId in~ (LegitimateAutomationAppIds)
+        or CallerIdentity has_any (LegitimateAutomationNames)
+| where not(IsWhitelistedIdentity)
 | extend
-    // Parent process analysis
-    IsSuspiciousParent = ParentProcess in~ (
-        "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
-        "acrord32.exe", "acrobat.exe", "foxit reader.exe",
-        "chrome.exe", "msedge.exe", "iexplore.exe", "firefox.exe",
-        "wscript.exe", "cscript.exe", "mshta.exe", "hta.exe",
-        "regsvr32.exe", "rundll32.exe", "odbcconf.exe"
-    ),
-    ParentIsCmdOrPowerShell = ParentProcess in~ ("cmd.exe", "powershell.exe", "pwsh.exe"),
-    ParentFromSuspiciousPath = ParentPath has_any (SuspiciousPaths)
-| extend
-    // User profile analysis
-    IsSystemAccount = AttackerAccount endswith "$",
-    IsAdminAccount = AttackerAccount has_any ("admin", "administrator"),
-    IsServiceAccount = AttackerAccount has_any ("service", "svc", "system")
-| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
-          ParentProcess, ParentCommandLine, ParentPath, SHA256, ProcessId,
-          IsStandardPath, IsFromSuspiciousPath, HasHighConfidenceMalicious, HasSuspiciousPattern,
-          HasSuspiciousModule, HasInlineExecution, HasBase64, HasNetworkIndicators,
-          HasProcessCreation, HasFileOperations, CommandLength, IsLongCommand, IsVeryLongCommand,
-          HasEncodedContent, HasObfuscation, IsSuspiciousParent, ParentIsCmdOrPowerShell,
-          ParentFromSuspiciousPath, IsSystemAccount, IsAdminAccount, IsServiceAccount;
+    // IP reputation analysis (THIS MAY BE A LESS USEFUL TACTIC COMPARATIVE TO THE OTHERS)
+    IsPrivateIP = ipv4_is_private(SourceIP),
+    IsCorporateIP = SourceIP has_any (CorporateIPRanges),
+    IsAzureIP = SourceIP startswith "20." or SourceIP startswith "40." or SourceIP startswith "52." or SourceIP startswith "104.",
+    IsPublicIP = not(IsPrivateIP) and not(IsAzureIP)
+| project TimeGenerated, OperationNameValue, OperationCategory, CallerIdentity, CallerIdentityType,
+          CallerObjectId, CallerAppId, SourceIP, ActivityStatusValue, SubscriptionId, ResourceGroupName,
+          ResourceName, IsCriticalSubscription, IsPublicIP, IsCorporateIP, IsAzureIP,
+          Properties, CorrelationId, _ResourceId;
 
-// --- Module 2: Script File Creation + Execution Correlation ---
-let RecentScriptFiles = DeviceFileEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where ActionType in ("FileCreated", "FileModified")
-| where FileName endswith ".py" or FileName endswith ".pl" or FileName endswith ".rb" 
-    or FileName endswith ".js" or FileName endswith ".php" or FileName endswith ".pyw"
-| extend FilePath = tolower(FolderPath)
-| where FilePath has_any (SuspiciousPaths)
-| extend
-    ScriptFileName = FileName,
-    ScriptCreationTime = TimeGenerated,
-    ScriptCreator = InitiatingProcessFileName,
-    ScriptCreatorAccount = AccountName
-| project ScriptCreationTime, DeviceName, ScriptFileName, ScriptFilePath = FolderPath,
-          ScriptCreator, ScriptCreatorAccount, ScriptSHA256 = SHA256;
-
-let ScriptCreationExecution = InterpreterExecution
-| join kind=inner (RecentScriptFiles) on DeviceName
-| where CommandLine contains ScriptFileName
-| where TimeGenerated between (ScriptCreationTime .. (ScriptCreationTime + FileCreationWindow))
-| extend
-    CreationToExecutionSeconds = datetime_diff('second', TimeGenerated, ScriptCreationTime),
-    Signal = "Script_Drop_and_Execute"
-| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
-          ParentProcess, ScriptFileName, ScriptFilePath, ScriptCreator, CreationToExecutionSeconds,
-          Signal, SHA256, HasHighConfidenceMalicious, HasSuspiciousPattern, IsFromSuspiciousPath;
-
-// --- Module 3: Network Activity Correlation ---  VERY CUSTOMIZABLE - WE SHOULD FURTHER BUILD OUT (ESP WITH THREAT INTEL ENRICHMENT)
-let InterpreterNetworkActivity = DeviceNetworkEvents
-| where TimeGenerated >= ago(LookbackWindow)
-| where InitiatingProcessFileName has_any (ScriptInterpreters)
-| where RemoteIPType in ("Public", "Loopback") or RemotePort in (4444, 4445, 8080, 8443, 443, 80)
-| extend
-    NetworkTime = TimeGenerated,
-    NetworkRemoteIP = RemoteIP,
-    NetworkRemotePort = RemotePort,
-    NetworkDirection = ActionType
+// --- Module 2: Blast Radius Analysis (Multiple Changes in Short Time) ---
+let BlastRadiusAttacks = SecurityModifications
 | summarize
-    NetworkConnections = count(),
-    UniqueIPs = dcount(RemoteIP),
-    RemoteIPs = make_set(RemoteIP, 10),
-    RemotePorts = make_set(RemotePort),
-    FirstNetworkActivity = min(TimeGenerated)
-    by DeviceName, InitiatingProcessId, InitiatingProcessFileName;
+    ModificationCount = count(),
+    OperationTypes = make_set(OperationCategory),
+    ResourcesAffected = make_set(ResourceName),
+    Subscriptions = make_set(SubscriptionId),
+    FirstModification = min(TimeGenerated),
+    LastModification = max(TimeGenerated)
+    by CallerIdentity, bin(TimeGenerated, CorrelationWindow)
+| where ModificationCount >= 3  // 3+ security changes in 30 minutes
+| extend
+    TimeSpanMinutes = datetime_diff('minute', LastModification, FirstModification),
+    UniqueOperationTypes = array_length(OperationTypes),
+    UniqueSubscriptions = array_length(Subscriptions),
+    Signal = "Blast_Radius_Attack"
+| project TimeGenerated = LastModification, CallerIdentity, ModificationCount, UniqueOperationTypes,
+          OperationTypes, ResourcesAffected, UniqueSubscriptions, TimeSpanMinutes, Signal;
 
-let NetworkCorrelation = InterpreterExecution
-| join kind=inner (InterpreterNetworkActivity) 
-    on DeviceName, $left.ProcessId == $right.InitiatingProcessId
-| where abs(datetime_diff('second', TimeGenerated, FirstNetworkActivity)) <= NetworkCorrelationWindow
-| extend Signal = "Interpreter_with_Network_Activity"
-| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
-          ParentProcess, NetworkConnections, UniqueIPs, RemoteIPs, RemotePorts, Signal,
-          HasHighConfidenceMalicious, HasSuspiciousPattern, IsFromSuspiciousPath;
+// --- Module 3: Specific High-Risk Operation Analysis ---
 
-// --- Module 4: Child Process Spawning ---
-let InterpreterChildProcesses = DeviceProcessEvents
+// Defender for Cloud pricing changes (disabling)
+let DefenderDisabling = SecurityModifications
+| where OperationCategory == "DefenderPlanChange"
+| extend PricingTier = tostring(parse_json(tostring(Properties)).pricingTier)
+| where PricingTier =~ "Free" or OperationNameValue has "delete"
+| extend
+    Signal = "Defender_Plan_Disabled",
+    DefenderPlan = tostring(split(_ResourceId, "/")[-1])
+| project TimeGenerated, CallerIdentity, CallerIdentityType, SourceIP, SubscriptionId,
+          DefenderPlan, PricingTier, Signal, IsCriticalSubscription;
+
+// Diagnostic settings deletion (audit evasion)
+let AuditLogDeletion = SecurityModifications
+| where OperationCategory == "AuditLogModification"
+| where OperationNameValue has "delete"
+| extend
+    Signal = "Audit_Log_Deletion",
+    AffectedResource = ResourceName
+| project TimeGenerated, CallerIdentity, CallerIdentityType, SourceIP, SubscriptionId,
+          ResourceGroupName, AffectedResource, Signal, IsCriticalSubscription;
+
+// Policy exemptions (compliance bypass)
+let PolicyExemptions = SecurityModifications
+| where OperationCategory == "PolicyExemption"
+| where OperationNameValue has "write"
+| extend
+    Signal = "Policy_Exemption_Created",
+    ExemptionName = ResourceName
+| project TimeGenerated, CallerIdentity, CallerIdentityType, SourceIP, SubscriptionId,
+          ExemptionName, Signal, IsCriticalSubscription;
+
+// Resource lock removal (protection bypass)
+let LockRemovals = SecurityModifications
+| where OperationCategory == "ResourceLockRemoval"
+| extend
+    Signal = "Resource_Lock_Removed",
+    ProtectedResource = tostring(split(_ResourceId, "/providers/Microsoft.Authorization")[0])
+| project TimeGenerated, CallerIdentity, CallerIdentityType, SourceIP, SubscriptionId,
+          ProtectedResource, Signal, IsCriticalSubscription;
+
+// Key Vault security changes
+let KeyVaultChanges = SecurityModifications
+| where OperationCategory == "KeyVaultSecurityChange"
+| extend
+    Properties_Json = parse_json(tostring(Properties)),
+    EnableSoftDelete = tobool(parse_json(tostring(Properties)).enableSoftDelete),
+    EnablePurgeProtection = tobool(parse_json(tostring(Properties)).enablePurgeProtection)
+| where EnableSoftDelete == false or EnablePurgeProtection == false or OperationNameValue has "delete"
+| extend
+    Signal = "KeyVault_Protection_Disabled",
+    KeyVaultName = ResourceName
+| project TimeGenerated, CallerIdentity, CallerIdentityType, SourceIP, SubscriptionId,
+          KeyVaultName, EnableSoftDelete, EnablePurgeProtection, Signal, IsCriticalSubscription;
+
+// --- Module 4: Identity Context Analysis ---
+let RecentRoleChanges = AzureActivity
 | where TimeGenerated >= ago(LookbackWindow)
-| where InitiatingProcessFileName has_any (ScriptInterpreters)
-| where FileName in~ (
-    "cmd.exe", "powershell.exe", "net.exe", "net1.exe",
-    "whoami.exe", "ipconfig.exe", "netstat.exe", "tasklist.exe",
-    "reg.exe", "wmic.exe", "vssadmin.exe", "wevtutil.exe"
-)
-| summarize
-    ChildProcesses = make_set(FileName),
-    ChildProcessCount = dcount(FileName),
-    ChildCommands = make_list(ProcessCommandLine, 20)
-    by DeviceName, InitiatingProcessId, InitiatingProcessFileName, InitiatingProcessAccountName;
+| where OperationNameValue has "Microsoft.Authorization/roleAssignments/write"
+| extend
+    NewRoleObjectId = tostring(parse_json(tostring(Claims)).["http://schemas.microsoft.com/identity/claims/objectidentifier"]),
+    RoleAssignmentTime = TimeGenerated
+| summarize RecentRoleAssignment = max(RoleAssignmentTime) by NewRoleObjectId;
 
-let ChildProcessCorrelation = InterpreterExecution
-| join kind=inner (InterpreterChildProcesses)
-    on DeviceName, $left.ProcessId == $right.InitiatingProcessId
-| extend Signal = "Interpreter_Spawning_Suspicious_Children"
-| project TimeGenerated, DeviceName, AttackerAccount, InterpreterName, ProcessPath, CommandLine,
-          ParentProcess, ChildProcesses, ChildProcessCount, ChildCommands, Signal,
-          HasHighConfidenceMalicious, HasSuspiciousPattern, IsFromSuspiciousPath;
+let SecurityModsWithRoleContext = SecurityModifications
+| join kind=leftouter (RecentRoleChanges) on $left.CallerObjectId == $right.NewRoleObjectId
+| extend
+    MinutesSinceRoleAssignment = datetime_diff('minute', TimeGenerated, RecentRoleAssignment),
+    IsRecentlyElevated = MinutesSinceRoleAssignment <= 60 and isnotnull(RecentRoleAssignment);
+
+// --- Module 5: Velocity Analysis ---
+let VelocityAnalysis = SecurityModifications
+| summarize
+    ModsInVelocityWindow = count(),
+    UniqueResourceGroups = dcount(ResourceGroupName),
+    UniqueSubscriptions = dcount(SubscriptionId)
+    by CallerIdentity, bin(TimeGenerated, VelocityWindow)
+| where ModsInVelocityWindow >= 5  // 5+ changes in 1 hour
+| extend Signal = "High_Velocity_Changes"
+| project TimeGenerated, CallerIdentity, ModsInVelocityWindow, UniqueResourceGroups,
+          UniqueSubscriptions, Signal;
 
 // --- Consolidate All Detections ---
-let StandaloneInterpreterAlerts = InterpreterExecution
-| where HasHighConfidenceMalicious
-    or (IsFromSuspiciousPath and not(IsStandardPath) and (HasSuspiciousPattern or HasInlineExecution))
-    or (IsSuspiciousParent and HasSuspiciousPattern)
-    or (IsVeryLongCommand and HasEncodedContent)
-    or (HasBase64 and HasNetworkIndicators and HasInlineExecution)
-| extend Signal = "Suspicious_Interpreter_Execution";
-
 let AllDetections = union isfuzzy=true
-    StandaloneInterpreterAlerts,
-    ScriptCreationExecution,
-    NetworkCorrelation,
-    ChildProcessCorrelation
+    (SecurityModsWithRoleContext | extend Signal = "Security_Modification"),
+    (BlastRadiusAttacks),
+    (DefenderDisabling),
+    (AuditLogDeletion),
+    (PolicyExemptions),
+    (LockRemovals),
+    (KeyVaultChanges),
+    (VelocityAnalysis)
 | extend
-    HasHighConfidenceMalicious = coalesce(HasHighConfidenceMalicious, false),
-    HasSuspiciousPattern = coalesce(HasSuspiciousPattern, false),
-    IsFromSuspiciousPath = coalesce(IsFromSuspiciousPath, false),
-    NetworkConnections = coalesce(NetworkConnections, 0),
-    ChildProcessCount = coalesce(ChildProcessCount, 0);
+    IsCriticalSubscription = coalesce(IsCriticalSubscription, false),
+    IsPublicIP = coalesce(IsPublicIP, false),
+    IsRecentlyElevated = coalesce(IsRecentlyElevated, false),
+    ModificationCount = coalesce(ModificationCount, 1),
+    ModsInVelocityWindow = coalesce(ModsInVelocityWindow, 1);
 
 // --- Risk Scoring ---
 AllDetections
 | extend
     BaseRisk = case(
-        Signal == "Script_Drop_and_Execute", 85,
-        Signal == "Interpreter_with_Network_Activity", 90,
-        Signal == "Interpreter_Spawning_Suspicious_Children", 80,
-        Signal == "Suspicious_Interpreter_Execution" and HasHighConfidenceMalicious, 95,
-        Signal == "Suspicious_Interpreter_Execution", 70,
+        Signal == "Defender_Plan_Disabled", 95,
+        Signal == "Audit_Log_Deletion", 90,
+        Signal == "Policy_Exemption_Created", 85,
+        Signal == "KeyVault_Protection_Disabled", 85,
+        Signal == "Resource_Lock_Removed", 80,
+        Signal == "Blast_Radius_Attack", 90,
+        Signal == "High_Velocity_Changes", 80,
+        Signal == "Security_Modification" and OperationCategory == "AuditLogModification", 85,
+        Signal == "Security_Modification", 70,
         60
     ),
     ContextBonus =
-        iff(HasHighConfidenceMalicious, 20, 0)
-        + iff(HasSuspiciousPattern and IsFromSuspiciousPath, 15, 0)
-        + iff(IsSuspiciousParent, 15, 0)
-        + iff(InterpreterName in~ ("perl.exe", "ruby.exe", "php.exe"), 10, 0)  // Less common = higher risk
-        + iff(HasInlineExecution and HasBase64, 15, 0)
-        + iff(HasEncodedContent, 10, 0)
-        + iff(ParentFromSuspiciousPath, 10, 0)
-        + iff(NetworkConnections > 0, 15, 0)
-        + iff(ChildProcessCount >= 3, 15, 0)
-        + iff(CreationToExecutionSeconds <= 60, 10, 0)  // Very quick execution after creation
-        + iff(hourofday(TimeGenerated) >= 22 or hourofday(TimeGenerated) <= 6, 5, 0),  // Off-hours
+        iff(IsCriticalSubscription, 20, 0)
+        + iff(IsPublicIP and not(IsCorporateIP), 20, 0)
+        + iff(CallerIdentityType == "ServicePrincipal" and CallerIdentity !has "microsoft", 15, 0)
+        + iff(IsRecentlyElevated, 15, 0)
+        + iff(ModificationCount >= 5, 15, 0)
+        + iff(UniqueSubscriptions >= 3, 10, 0)
+        + iff(hourofday(TimeGenerated) >= 22 or hourofday(TimeGenerated) <= 6, 10, 0),  // Off-hours
     TotalRiskScore = BaseRisk + ContextBonus
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 90, "Critical",
-        TotalRiskScore >= 75, "High",
+        TotalRiskScore >= 100, "Critical",
+        TotalRiskScore >= 80, "High",
         TotalRiskScore >= 60, "Medium",
         "Low"
     )
@@ -298,76 +322,66 @@ AllDetections
 | extend
     Evidence = bag_pack(
         "Signal", Signal,
-        "InterpreterPath", ProcessPath,
-        "CommandLine", CommandLine,
-        "ParentProcess", ParentProcess,
-        "ParentCommandLine", ParentCommandLine,
-        "HasHighConfidenceMalicious", HasHighConfidenceMalicious,
-        "HasSuspiciousPattern", HasSuspiciousPattern,
-        "IsFromSuspiciousPath", IsFromSuspiciousPath,
-        "NetworkConnections", NetworkConnections,
-        "RemoteIPs", RemoteIPs,
-        "ChildProcesses", ChildProcesses,
-        "ScriptFile", ScriptFileName,
-        "CreationToExecutionSeconds", CreationToExecutionSeconds
+        "OperationType", coalesce(OperationCategory, OperationTypes),
+        "Caller", CallerIdentity,
+        "CallerType", CallerIdentityType,
+        "SourceIP", SourceIP,
+        "Subscription", coalesce(SubscriptionId, Subscriptions),
+        "ResourceGroup", ResourceGroupName,
+        "AffectedResources", coalesce(ResourceName, ResourcesAffected),
+        "ModificationCount", ModificationCount,
+        "IsPublicIP", IsPublicIP,
+        "IsRecentlyElevated", IsRecentlyElevated,
+        "IsCriticalSubscription", IsCriticalSubscription
     ),
-    MITRETechniques = case(
-        InterpreterName has "python", "T1059.006 (Python)",
-        InterpreterName has "node", "T1059.007 (JavaScript)",
-        InterpreterName has "perl", "T1059 (Command and Scripting Interpreter)",
-        InterpreterName has "ruby", "T1059 (Command and Scripting Interpreter)",
-        InterpreterName has "php", "T1059 (Command and Scripting Interpreter)",
-        "T1059 (Command and Scripting Interpreter)"
-    ),
+    MITRETechniques = "T1562.001 (Impair Defenses: Disable or Modify Cloud Security Controls)",
     RecommendedActions = case(
-        AlertSeverity == "Critical", "IMMEDIATE: Isolate device, kill process tree, quarantine script file, investigate for C2 communication and lateral movement. Review account for compromise.",
-        AlertSeverity == "High", "URGENT: Validate script execution legitimacy, analyze script content, check network connections, review spawned processes. Investigate parent process chain.",
-        "Review script execution context, validate against approved automation, check for signs of malicious intent"
+        AlertSeverity == "Critical", "IMMEDIATE: Isolate identity, review all recent changes, restore security controls, investigate for data exfiltration or lateral movement. Check for compromised credentials.",
+        AlertSeverity == "High", "URGENT: Validate change authorization against change management records. If unauthorized, immediately restore controls and investigate identity compromise. Review audit logs for tampering.",
+        "Review change context and authorization. Validate against scheduled maintenance windows. Ensure change follows security procedures."
     )
 | project
     TimeGenerated,
     AlertSeverity,
     TotalRiskScore,
-    DeviceName,
-    AttackerAccount,
-    InterpreterName,
-    ProcessPath,
-    ParentProcess,
-    CommandLine,
     Signal,
-    NetworkConnections = coalesce(NetworkConnections, 0),
-    RemoteIPs = coalesce(RemoteIPs, dynamic([])),
-    ChildProcessCount = coalesce(ChildProcessCount, 0),
-    ChildProcesses = coalesce(ChildProcesses, dynamic([])),
+    CallerIdentity = coalesce(CallerIdentity, "Unknown"),
+    CallerType = coalesce(CallerIdentityType, "Unknown"),
+    SourceIP = coalesce(SourceIP, "Unknown"),
+    SubscriptionId = coalesce(SubscriptionId, tostring(Subscriptions)),
+    OperationType = coalesce(OperationCategory, tostring(OperationTypes)),
+    AffectedResources = coalesce(ResourceName, tostring(ResourcesAffected)),
+    ModificationCount = coalesce(ModificationCount, ModsInVelocityWindow),
     Evidence,
     MITRETechniques,
     RecommendedActions
 | sort by TotalRiskScore desc, TimeGenerated desc
 
 references:
-  - https://attack.mitre.org/techniques/T1059/
-  - https://attack.mitre.org/techniques/T1059/006/
-  - https://attack.mitre.org/techniques/T1059/007/
-  - https://www.volexity.com/blog/2021/08/24/north-korean-bluelight-special-inkysquid-deploys-rokrat/
-  - https://www.iranwatch.org/sites/default/files/public-intelligence-alert.pdf
-  - https://blog.talosintelligence.com/arcanedoor-new-espionage-focused-campaign-found-targeting-perimeter-network-devices/
-  - https://research.checkpoint.com/2020/bandook-signed-delivered/
-  - https://cloud.google.com/blog/topics/threat-intelligence/investigating-ivanti-zero-day-exploitation/
+  - https://attack.mitre.org/techniques/T1562/001/
+  - https://attack.mitre.org/techniques/T1098/001/
+  - https://redcanary.com/threat-detection-report/techniques/disabling-security-tools/
+  - https://www.guidepointsecurity.com/newsroom/akira-ransomware-abuses-cpu-tuning-tool-to-disable-microsoft-defender/
+  - https://www.scworld.com/brief/akira-ransomware-seeks-to-deactivate-microsoft-defender
+  - https://www.microsoft.com/en-us/security/blog/2021/01/20/deep-dive-into-the-solorigate-second-stage-activation-from-sunburst-to-teardrop-and-raindrop/
 
 triage: |
-  This alert means an interpreter (Python, Node.js, etc.) is likely running malicious or heavily obfuscated code, potentially connecting to an attacker.
-    1. Immediate Containment & Process Termination
-      •	Isolate Device: Immediately isolate the DeviceName to prevent C2 communications, data exfiltration, and lateral movement.
-      •	Terminate Process Tree: Identify the ProcessId of the script interpreter (InterpreterName) and terminate the entire process tree. This stops the script and any malicious child processes it may have spawned (e.g., cmd.exe, powershell.exe).
-      •	Block Indicators: Review the RemoteIPs and RemotePorts from the evidence and immediately block these indicators at the firewall/perimeter level.
-    2. Forensic Artifact Collection
-      •	Locate and Analyze Script: If the Evidence includes a ScriptFile (ScriptFileName and ScriptFilePath), quarantine and collect the file. Analyze its contents immediately to determine its true function (e.g., reverse shell, keylogger, credential dumper).
-      •	Analyze Command Line: Review the CommandLine for encoded or embedded content. Attempt to decode the command (e.g., Base64 strings) to find the true instructions, URLs, C2 domains, or final payload.
-    3. Contextual Scoping & Follow-on Activity
-      •	Parent Process Review: Investigate the ParentProcess (e.g., browser, email client, Office app). This is the initial entry point. Review the parent application's activity just prior to the alert for signs of an exploit, drive-by download, or successful phishing attack.
-      •	Child Process Review: Review the ChildProcesses list. If it includes reconnaissance tools (whoami, netstat, wmic), the attacker is actively gaining intel. If it includes dumping tools or lateral movement binaries, escalate the containment scope immediately.
-      •	Account Remediation: The AttackerAccount is compromised. Force a password reset and investigate their login history for lateral movement attempts from new hosts.
-
+  This alert signals that a successful API call was made to disable, delete, or modify core cloud security controls (e.g., turning off Defender for Cloud, deleting audit settings, or removing resource locks).
+    1. Immediate Identity & Scope Isolation
+      •	Isolate Identity: Immediately disable or revoke the credentials for the CallerIdentity (User or Service Principal). If possible, suspend the identity's session and force a token refresh.
+      •	Network Isolation (API): If the change originated from a highly suspicious, external SourceIP (especially if a public/non-corporate IP), consider temporarily blocking that IP from accessing your cloud management plane.
+      •	Identify Blast Radius: Review the ModificationCount and AffectedResources in the evidence. Determine if the attacker targeted a single resource or spread the evasion across multiple Subscriptions or Resource Groups.
+    2. Reverse Defense Evasion
+      •	Restore Controls: The most critical step is to immediately restore the security controls that were modified or deleted. Prioritize the following based on the OperationType:
+        o	Audit Log Modification: Re-enable or re-link the Diagnostic Settings for the affected resources.
+        o	Defender Plan Change: Revert the security Pricing Tier back to the standard/paid tier.
+        o	Resource Lock Removal: Re-apply the Resource Lock to prevent resource deletion.
+        o	Key Vault Protection: Re-enable Soft Delete and Purge Protection on the Key Vault.
+      •	Restore Policy: If a security policy was deleted or an exemption was created, re-apply the policy assignment or delete the new policy exemption.
+    3. Compromise Scoping and Remediation
+      •	Check for Pre-Attack PE: Review the logs for the CallerIdentity in the hour preceding the attack. Look for the IsRecentlyElevated flag. If true, investigate the Role Assignment to understand how the attacker gained the necessary permissions to make the security change.
+      •	Follow-on Attack: The security change was likely a preparation step. Immediately pivot to the affected resources and look for the attacker's next move (e.g., Key Vault Access, Virtual Machine Execution, Data Exfiltration to external storage accounts).
+      •	Escalate: Confirm the incident as a breach involving T1562.001 (Impair Defenses) and escalate, providing the full timeline of Privilege Escalation (if detected) and Defense Evasion.
 
 notes: |
-  - Lots of opportunity to enrich in Module 3, esp if TA infrastructure tracking is a possible enrichment
+  - May be difficult to balance specific whitelisting with ensuring wide-ranging adoption of this analytic (e.g. balancing specificity vs FP rate), but if analytic is functional it may be worth the effort.
