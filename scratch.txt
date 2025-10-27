@@ -32,324 +32,269 @@ tags:
 logic:
   query: |
 
-// Lateral Movement: Service Account Logon Anomaly Detection 
-// Detects service accounts authenticating to unusual devices, indicating potential lateral movement
+// LSASS Credential Dumping Detection
+// Detects unauthorized memory access to LSASS.exe for credential harvesting
 
-// Configuration
-let BaselinePeriod = 30d;    // Extended baseline 
-let DetectionWindow = 7d;     // Active detection period
-let MinBaselineLogons = 3;    // Minimum logons to establish valid baseline
-let VelocityWindow = 5m;      // Window for detecting rapid logon attempts
-let OffHoursStart = 1;       // 9am THESE PROBABLY WILL NOT WORK TBH - Right now just tuned to RU/CN day shift and that's kind of dumb
-let OffHoursEnd = 9;          // 5pm Beijing/Guangdong time
+// Parameters
+let DetectionWindow = 7d;
+let BaselineWindow = 30d;
+let TargetProcess = "lsass.exe";
 
-// Service account identification patterns (THESE MUST BE VERY PRECISE AND REAL)
-let ServiceAccountPrefixes = dynamic([
-    "svc", "svc_", "svc-", "service", "srv", "srv_",
-    "app", "appsvc", "automation", "sql", "iis", "mon"
+// Known credential dumping tools
+let CredentialDumpingTools = dynamic([
+    "mimikatz.exe", "mimilib.dll", "mimidrv.sys",
+    "procdump.exe", "procdump64.exe",
+    "dumpert.exe", "nanodump.exe",
+    "sqldumper.exe", "createdump.exe",
+    "out-minidump", "invoke-mimikatz",
+    "sharpdump.exe", "pypykatz",
+    "lsassy", "secretsdump"
 ]);
 
-let ServiceAccountSuffixes = dynamic([
-    "$",           // Managed Service Accounts (MSA/gMSA)
-    "service",
-    "svc",
-    "sql",
-    "admin",       // Often service admin accounts
-    "system"
+// Legitimate processes that may access LSASS (customize for your environment)
+let LegitimateAccessors = dynamic([
+    // Windows System Processes
+    "csrss.exe", "wininit.exe", "services.exe", "svchost.exe",
+    "lsm.exe", "smss.exe", "winlogon.exe", "logonui.exe",
+    // Security Software
+    "msmpeng.exe", "mpcmdrun.exe", "msseces.exe", "nissrv.exe",  // Windows Defender
+    "avp.exe", "kavtray.exe",                                     // Kaspersky
+    "mcshield.exe", "mfevtps.exe",                               // McAfee
+    "savservice.exe", "sophoshealth.exe",                        // Sophos
+    "ccsvchst.exe", "ccsvchst.exe",                              // Symantec
+    // EDR/Security Tools
+    "taniumclient.exe", "cb.exe", "sentinelone.exe",
+    "crowdstrike.exe", "falconsensor.exe",
+    // System Management
+    "wmiprvse.exe", "taskmgr.exe",
+    // Monitoring/Diagnostic (if approved)
+    "procexp.exe", "procexp64.exe", "procmon.exe", "procmon64.exe"  // Sysinternals (if authorized)
 ]);
 
-// Built-in Windows service accounts
-let BuiltInServiceAccounts = dynamic([
-    "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE",
-    "NT AUTHORITY\\SYSTEM", "NT AUTHORITY\\LOCAL SERVICE",
-    "NT AUTHORITY\\NETWORK SERVICE"
+// Suspicious execution paths
+let SuspiciousPaths = dynamic([
+    "\\temp\\", "\\tmp\\", 
+    "\\appdata\\local\\temp\\", "\\appdata\\roaming\\",
+    "\\programdata\\", "\\public\\", "\\users\\public\\",
+    "\\downloads\\", "\\desktop\\",
+    "\\perflogs\\", "\\recycler\\", "\\recycle.bin\\",
+    "\\inetpub\\", "\\wwwroot\\"
 ]);
 
-// Privileged groups (high-value targets for attackers)
-let PrivilegedGroups = dynamic([
-    "Domain Admins", "Enterprise Admins", "Schema Admins",
-    "Administrators", "Account Operators", "Backup Operators",
-    "Server Operators", "Print Operators"
+// High-privilege access rights for memory reading
+// Reference: https://docs.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights
+let DangerousAccessRights = dynamic([
+    "0x1410",     // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+    "0x1fffff",   // PROCESS_ALL_ACCESS
+    "0x1000",     // PROCESS_QUERY_LIMITED_INFORMATION  
+    "0x0010",     // PROCESS_VM_READ
+    "0x0400",     // PROCESS_QUERY_INFORMATION
+    "0x0800"      // PROCESS_SUSPEND_RESUME
 ]);
 
-// Known admin workstations/jump boxes (AGAIN - VERY IMPORTANT TO BE PRECISE)
-let AdminWorkstations = dynamic([
-    // "ADMIN-WS-01", "JUMP-BOX-01", "PAW-"
-]);
+// Get baseline of LSASS access patterns
+let LsassAccessBaseline =
+    DeviceEvents
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(DetectionWindow))
+    | where ActionType == "OpenProcessApiCall"
+    | where FileName =~ TargetProcess or ProcessCommandLine has TargetProcess
+    | summarize 
+        BaselineAccessCount = count(),
+        BaselineAccessors = make_set(InitiatingProcessFileName)
+    by DeviceName;
 
-// --- Get Current Device Information ---
-let CurrentDevices = DeviceInfo
-| where TimeGenerated >= ago(1d)
-| summarize arg_max(TimeGenerated, *) by DeviceId
-| extend
-    IsWorkstation = OSPlatform contains "Windows" and (DeviceType =~ "Workstation" or DeviceType =~ "Laptop"),
-    IsServer = OSPlatform contains "Server" or DeviceType =~ "Server",
-    IsDomainController = DeviceName has "DC" or DeviceName has "DC-" or DeviceName startswith "DC",
-    IsVDI = DeviceName has "VDI" or DeviceName has "VIRTUAL",
-    DeviceCategory = case(
-        OSPlatform contains "Server" or DeviceType =~ "Server", "Server",
-        DeviceType =~ "Workstation" or DeviceType =~ "Laptop", "Workstation",
-        "Other"
-    )
-| project DeviceId, DeviceName, OSPlatform, DeviceType, DeviceCategory,
-          IsWorkstation, IsServer, IsDomainController, IsVDI;
-
-// --- Module 1: Build Service Account Baseline ---
-let ServiceAccountBaseline = DeviceLogonEvents
-| where TimeGenerated between (ago(BaselinePeriod) .. ago(DetectionWindow))
-| where ActionType == "LogonSuccess"
-| extend AccountLower = tolower(AccountName)
-// Identify service accounts
-| where AccountLower has_any (ServiceAccountPrefixes)
-    or AccountLower has_any (ServiceAccountSuffixes)
-    or AccountName in~ (BuiltInServiceAccounts)
-    or AccountName endswith "$"
-| join kind=inner (CurrentDevices) on DeviceId
-| summarize
-    BaselineDevices = make_set(DeviceName),
-    BaselineDeviceIds = make_set(DeviceId),
-    BaselineLogonCount = count(),
-    BaselineDeviceTypes = make_set(DeviceCategory),
-    FirstSeen = min(TimeGenerated),
-    LastSeen = max(TimeGenerated),
-    CommonLogonTypes = make_set(LogonType),
-    CommonHours = make_set(hourofday(TimeGenerated))
-    by AccountDomain, AccountName
-| where BaselineLogonCount >= MinBaselineLogons  // Filter accounts with insufficient baseline
-| extend
-    BaselineDeviceCount = array_length(BaselineDevices),
-    HasEstablishedPattern = datetime_diff('day', LastSeen, FirstSeen) >= 7;  // At least 1 week of activity
-
-// --- Module 2: Detect Anomalous Service Account Logons ---
-let AnomalousLogons = DeviceLogonEvents
+// Module 1: Direct Process Access Events (Primary Detection)
+let DirectLsassAccess = DeviceEvents
 | where TimeGenerated >= ago(DetectionWindow)
-| where ActionType == "LogonSuccess"
-| extend AccountLower = tolower(AccountName)
-// Identify service accounts
-| where AccountLower has_any (ServiceAccountPrefixes)
-    or AccountLower has_any (ServiceAccountSuffixes)
-    or AccountName in~ (BuiltInServiceAccounts)
-    or AccountName endswith "$"
-| join kind=inner (CurrentDevices) on DeviceId
+| where ActionType in ("OpenProcessApiCall", "ProcessAccess", "SetThreadContextRemoteApiCall")
+// Target process is LSASS
+| where FileName =~ TargetProcess 
+    or ProcessCommandLine has TargetProcess
+    or AdditionalFields has TargetProcess
 | extend
-    LogonHour = hourofday(TimeGenerated),
-    IsOffHours = LogonHour >= OffHoursStart or LogonHour <= OffHoursEnd
-// Join with baseline
-| join kind=leftouter (ServiceAccountBaseline) on AccountDomain, AccountName
+    AccessingProcess = InitiatingProcessFileName,
+    AccessingProcessPath = tolower(InitiatingProcessFolderPath),
+    AccessingCommandLine = InitiatingProcessCommandLine,
+    AccessingParentProcess = InitiatingProcessParentFileName,
+    AccessMask = tostring(AdditionalFields.DesiredAccess),
+    TargetProcessId = ProcessId,
+    AccessingAccount = InitiatingProcessAccountName,
+    AccessingDomain = InitiatingProcessAccountDomain
 | extend
-    // Determine if this is a new device
-    IsNewDevice = DeviceId !in (coalesce(BaselineDeviceIds, dynamic([]))),
-    HasBaseline = isnotnull(BaselineDeviceCount),
-    IsNewDeviceType = DeviceCategory !in (coalesce(BaselineDeviceTypes, dynamic([]))),
-    IsUnusualLogonType = LogonType !in (coalesce(CommonLogonTypes, dynamic([]))),
-    IsUnusualHour = LogonHour !in (coalesce(CommonHours, dynamic([])))
-| where IsNewDevice and HasBaseline  // Core detection: new device with existing baseline
-| extend
-    RemoteDeviceCount = tostring(RemoteDeviceCount),
-    RemoteIP = tostring(RemoteIP),
-    RemotePort = tostring(RemotePort)
-| project TimeGenerated, AccountDomain, AccountName, DeviceId, DeviceName, DeviceCategory,
-          IsWorkstation, IsServer, IsDomainController, LogonType, RemoteDeviceCount, RemoteIP,
-          RemotePort, IsOffHours, IsNewDevice, IsNewDeviceType, IsUnusualLogonType,
-          BaselineDeviceCount, BaselineDevices, BaselineLogonCount, LogonId;
+    // Detection flags
+    IsKnownDumpingTool = AccessingProcess has_any (CredentialDumpingTools) 
+        or AccessingCommandLine has_any (CredentialDumpingTools),
+    IsLegitimateAccessor = AccessingProcess in~ (LegitimateAccessors),
+    IsFromSuspiciousPath = AccessingProcessPath has_any (SuspiciousPaths),
+    HasDangerousAccessRights = AccessMask has_any (DangerousAccessRights) or AccessMask == "",  // Empty often means full access
+    IsUnsignedBinary = isempty(InitiatingProcessVersionInfoOriginalFileName) or InitiatingProcessVersionInfoOriginalFileName == "",
+    IsScriptingEngine = AccessingProcess in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe"),
+    IsOffHours = hourofday(TimeGenerated) not between (7 .. 19)  // Outside business hours
+| where not(IsLegitimateAccessor)  // Filter known good
+| extend DetectionMethod = "Direct-Process-Access";
 
-// --- Module 3: Failed Logon Correlation ---
-let FailedLogons = DeviceLogonEvents
+// Module 2: LSASS Memory Dump File Creation
+let LsassDumpFiles = DeviceFileEvents
 | where TimeGenerated >= ago(DetectionWindow)
-| where ActionType == "LogonFailed"
-| extend AccountLower = tolower(AccountName)
-| where AccountLower has_any (ServiceAccountPrefixes)
-    or AccountLower has_any (ServiceAccountSuffixes)
-    or AccountName endswith "$"
-| summarize
-    FailedAttempts = count(),
-    FailedDevices = make_set(DeviceName),
-    FirstFailure = min(TimeGenerated),
-    LastFailure = max(TimeGenerated)
-    by AccountDomain, AccountName, bin(TimeGenerated, 1h);
-
-let LogonsWithFailures = AnomalousLogons
-| join kind=leftouter (
-    FailedLogons
-    | extend JoinTime = bin(TimeGenerated, 1h)
-) on AccountDomain, AccountName, $left.TimeGenerated == $right.JoinTime
+| where ActionType in ("FileCreated", "FileRenamed")
+| where FileName endswith ".dmp" 
+    or FileName has "lsass"
+    or FileName matches regex @"(?i)lsass.*\.dmp$"
+    or FileName matches regex @"(?i).*dump.*\.dmp$"
 | extend
-    HadRecentFailures = isnotnull(FailedAttempts),
-    FailedAttempts = coalesce(FailedAttempts, 0),
-    FailureToSuccessSeconds = iff(isnotnull(FirstFailure), datetime_diff('second', TimeGenerated, LastFailure), 0);
-
-// --- Module 4: Velocity Analysis (Rapid Successive Logons) ---
-let VelocityAnalysis = AnomalousLogons
-| extend AccountKey = strcat(AccountDomain, "\\", AccountName)
-| order by AccountKey, TimeGenerated asc
-| extend PreviousLogonTime = prev(TimeGenerated, 1)
-| extend TimeDelta = datetime_diff('second', TimeGenerated, PreviousLogonTime)
-| where TimeDelta <= 300  // Within 5 minutes
-| summarize
-    RapidLogonCount = count(),
-    RapidTargetDevices = make_set(DeviceName),
-    RapidLogonSpan = datetime_diff('second', max(TimeGenerated), min(TimeGenerated))
-    by AccountDomain, AccountName, bin(TimeGenerated, VelocityWindow);
-
-let LogonsWithVelocity = LogonsWithFailures
-| join kind=leftouter (VelocityAnalysis) 
-    on AccountDomain, AccountName
+    AccessingProcess = InitiatingProcessFileName,
+    AccessingProcessPath = tolower(InitiatingProcessFolderPath),
+    AccessingCommandLine = InitiatingProcessCommandLine,
+    AccessingParentProcess = InitiatingProcessParentFileName,
+    DumpFilePath = FolderPath,
+    AccessingAccount = InitiatingProcessAccountName,
+    AccessingDomain = InitiatingProcessAccountDomain
 | extend
-    RapidLogonCount = coalesce(RapidLogonCount, 0),
-    IsSprayPattern = RapidLogonCount >= 3;
+    IsKnownDumpingTool = AccessingProcess has_any (CredentialDumpingTools),
+    IsLegitimateAccessor = AccessingProcess in~ (LegitimateAccessors),
+    IsFromSuspiciousPath = AccessingProcessPath has_any (SuspiciousPaths) or DumpFilePath has_any (SuspiciousPaths),
+    HasDangerousAccessRights = true,  // Creating dump file implies access
+    IsUnsignedBinary = isempty(InitiatingProcessVersionInfoOriginalFileName),
+    IsScriptingEngine = AccessingProcess in~ ("powershell.exe", "pwsh.exe", "cmd.exe"),
+    IsOffHours = hourofday(TimeGenerated) not between (7 .. 19)
+| where not(IsLegitimateAccessor)
+| extend DetectionMethod = "LSASS-Dump-File-Creation";
 
-// --- Module 5: Privileged Account Context ---
-let PrivilegedAccounts = IdentityInfo
-| where TimeGenerated >= ago(7d)
-| where AssignedRoles has_any (PrivilegedGroups)
-| summarize
-    PrivilegedRoles = make_set(AssignedRoles),
-    IsPrivileged = true
-    by AccountDomain, AccountName = tolower(AccountUpn);
-
-let LogonsWithPrivilegeContext = LogonsWithVelocity
-| join kind=leftouter (PrivilegedAccounts)
-    on AccountDomain, $left.AccountName == $right.AccountName
-| extend
-    IsPrivileged = coalesce(IsPrivileged, false),
-    PrivilegedRoles = coalesce(PrivilegedRoles, dynamic([]));
-
-// --- Module 6: Source Device Analysis ---
-let SourceDeviceContext = DeviceLogonEvents
+// Module 3: Task Manager / Debugging Tools (Context-Aware)
+let TaskManagerDump = DeviceProcessEvents
 | where TimeGenerated >= ago(DetectionWindow)
-| where ActionType == "LogonSuccess"
-| extend SourceDevice = RemoteDeviceName
-| where isnotempty(SourceDevice)
-| join kind=inner (CurrentDevices) on $left.SourceDevice == $right.DeviceName
-| summarize
-    SourceDeviceCategory = any(DeviceCategory),
-    SourceIsWorkstation = any(IsWorkstation)
-    by LogonId;
-
-let LogonsWithSourceContext = LogonsWithPrivilegeContext
-| join kind=leftouter (SourceDeviceContext) on LogonId
+| where FileName =~ "taskmgr.exe" and ProcessCommandLine has "lsass"
+    or (FileName in~ ("procdump.exe", "procdump64.exe") and ProcessCommandLine has "lsass")
+    or (FileName =~ "rundll32.exe" and ProcessCommandLine has_any ("MiniDumpW", "comsvcs.dll"))
 | extend
-    SourceDeviceCategory = coalesce(SourceDeviceCategory, "Unknown"),
-    SourceIsWorkstation = coalesce(SourceIsWorkstation, false);
-
-// --- Module 7: Lateral Movement Pattern Detection ---
-let LateralMovementPatterns = LogonsWithSourceContext
-| extend AccountKey = strcat(AccountDomain, "\\", AccountName)
-| summarize
-    UniqueTargets = dcount(DeviceName),
-    TargetDevices = make_set(DeviceName),
-    TargetCategories = make_set(DeviceCategory),
-    HasDCTarget = max(toint(IsDomainController)),
-    HasWorkstationTarget = max(toint(IsWorkstation)),
-    FirstLogon = min(TimeGenerated),
-    LastLogon = max(TimeGenerated)
-    by AccountKey, AccountDomain, AccountName, bin(TimeGenerated, 1h)
-| where UniqueTargets >= 3  // Logged onto 3+ different devices in 1 hour
+    AccessingProcess = FileName,
+    AccessingProcessPath = tolower(FolderPath),
+    AccessingCommandLine = ProcessCommandLine,
+    AccessingParentProcess = InitiatingProcessParentFileName,
+    AccessingAccount = AccountName,
+    AccessingDomain = AccountDomain
 | extend
-    LateralMovementSpan = datetime_diff('minute', LastLogon, FirstLogon),
-    Signal = "Lateral_Movement_Pattern";
+    IsKnownDumpingTool = AccessingProcess has_any (CredentialDumpingTools) 
+        or AccessingCommandLine has "comsvcs.dll",  // Classic DLL injection technique
+    IsLegitimateAccessor = false,  // These need validation
+    IsFromSuspiciousPath = AccessingProcessPath has_any (SuspiciousPaths),
+    HasDangerousAccessRights = true,
+    IsUnsignedBinary = false,
+    IsScriptingEngine = false,
+    IsOffHours = hourofday(TimeGenerated) not between (7 .. 19)
+| extend DetectionMethod = "Dumping-Tool-Execution";
 
-// --- Consolidate All Detections ---
-let AllDetections = LogonsWithSourceContext
-| extend
-    IsPrivileged = coalesce(IsPrivileged, false),
-    HadRecentFailures = coalesce(HadRecentFailures, false),
-    IsSprayPattern = coalesce(IsSprayPattern, false),
-    FailedAttempts = coalesce(FailedAttempts, 0);
+// Combine all detection methods
+let AllLsassAccess = union isfuzzy=true DirectLsassAccess, LsassDumpFiles, TaskManagerDump;
 
-let FinalDetections = union isfuzzy=true
-    (AllDetections | extend Signal = "New_Device_Logon"),
-    (LateralMovementPatterns | extend Signal = "Lateral_Movement_Pattern")
+// Risk Scoring and Analysis
+AllLsassAccess
 | extend
-    IsWorkstation = coalesce(IsWorkstation, false),
-    IsDomainController = coalesce(IsDomainController, false),
-    IsOffHours = coalesce(IsOffHours, false),
-    IsNewDeviceType = coalesce(IsNewDeviceType, false),
-    IsUnusualLogonType = coalesce(IsUnusualLogonType, false),
-    BaselineDeviceCount = coalesce(BaselineDeviceCount, 0),
-    UniqueTargets = coalesce(UniqueTargets, 1);
-
-// --- Risk Scoring ---
-FinalDetections
-| extend
-    BaseRisk = case(
-        Signal == "Lateral_Movement_Pattern", 90,
-        LogonType in ("10", "RemoteInteractive"), 85,      // RDP logon
-        LogonType in ("3", "Network"), 75,                  // Network logon (common LM)
-        LogonType in ("2", "Interactive"), 70,
-        60
+    // Base risk by detection method
+    MethodRisk = case(
+        DetectionMethod == "LSASS-Dump-File-Creation", 40,  // Creating dump is direct evidence
+        DetectionMethod == "Dumping-Tool-Execution", 35,    // Known tool usage
+        DetectionMethod == "Direct-Process-Access", 30,     // Process access attempt
+        20
     ),
-    TargetBonus =
-        iff(IsDomainController, 30, 0)                      // DC access = critical
-        + iff(IsWorkstation and not(DeviceName has_any (AdminWorkstations)), 20, 0)  // User workstation
-        + iff(IsNewDeviceType, 10, 0)                       // New device type
-        + iff(BaselineDeviceCount <= 5, 10, 0),            // Low baseline (account rarely used)
-    ContextBonus =
-        iff(IsPrivileged, 25, 0)                           // Privileged account
-        + iff(HadRecentFailures, 20, 0)                    // Failed attempts before success
-        + iff(IsSprayPattern, 15, 0)                       // Rapid successive logons
-        + iff(IsOffHours, 10, 0)                           // Off-hours activity
-        + iff(IsUnusualLogonType, 10, 0)                   // Unusual logon type for this account
-        + iff(UniqueTargets >= 5, 20, 0)                   // High lateral movement
-        + iff(SourceIsWorkstation, 10, 0),                 // Originating from workstation
-    TotalRiskScore = BaseRisk + TargetBonus + ContextBonus
+    
+    // Tool/process risk
+    ToolRisk = case(
+        IsKnownDumpingTool, 35,                   // Known credential dumping tool
+        AccessingProcess in~ ("procdump.exe", "procdump64.exe", "taskmgr.exe"), 25,  // Dumping capability
+        AccessingProcess =~ "rundll32.exe", 20,   // Common LOLBAS
+        IsScriptingEngine, 15,                    // Scripting wrapper
+        10
+    ),
+    
+    // Context risk
+    ContextRisk = case(
+        IsFromSuspiciousPath and IsUnsignedBinary, 25,  // Suspicious path + unsigned
+        IsFromSuspiciousPath, 20,                       // Suspicious execution location
+        IsUnsignedBinary, 15,                           // Unsigned binary
+        IsOffHours, 10,                                 // Off-hours access
+        5
+    ),
+    
+    // Access rights risk
+    AccessRisk = case(
+        HasDangerousAccessRights, 10,  // Has memory read capability
+        5
+    ),
+    
+    TotalRiskScore = MethodRisk + ToolRisk + ContextRisk + AccessRisk
+
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 110, "Critical",
-        TotalRiskScore >= 85, "High",
-        TotalRiskScore >= 65, "Medium",
+        TotalRiskScore >= 85, "Critical",
+        TotalRiskScore >= 70, "High",
+        TotalRiskScore >= 50, "Medium",
         "Low"
     )
-| where AlertSeverity in ("Critical", "High", "Medium")
+
+// Join with baseline for anomaly detection
+| join kind=leftouter (LsassAccessBaseline) on DeviceName
 | extend
-    Evidence = bag_pack(
-        "Signal", Signal,
-        "Account", strcat(AccountDomain, "\\", AccountName),
-        "TargetDevice", coalesce(DeviceName, "Multiple"),
-        "DeviceCategory", coalesce(DeviceCategory, "Multiple"),
-        "LogonType", LogonType,
-        "BaselineDevices", BaselineDeviceCount,
-        "IsPrivileged", IsPrivileged,
-        "PrivilegedRoles", PrivilegedRoles,
-        "IsDomainController", IsDomainController,
-        "IsWorkstation", IsWorkstation,
-        "IsOffHours", IsOffHours,
-        "HadRecentFailures", HadRecentFailures,
-        "FailedAttempts", FailedAttempts,
-        "RapidLogons", IsSprayPattern,
-        "UniqueTargets", UniqueTargets,
-        "TargetDevices", coalesce(TargetDevices, BaselineDevices),
-        "RemoteIP", RemoteIP
+    IsAnomalousAccessor = not(BaselineAccessors has AccessingProcess),
+    AdjustedRiskScore = TotalRiskScore + iff(IsAnomalousAccessor, 15, 0)
+
+| extend
+    Evidence = pack(
+        "DetectionMethod", DetectionMethod,
+        "AccessingProcess", AccessingProcess,
+        "AccessingProcessPath", AccessingProcessPath,
+        "AccessingCommandLine", AccessingCommandLine,
+        "ParentProcess", AccessingParentProcess,
+        "AccessMask", AccessMask,
+        "TargetProcessId", TargetProcessId,
+        "IsKnownDumpingTool", IsKnownDumpingTool,
+        "IsFromSuspiciousPath", IsFromSuspiciousPath,
+        "IsUnsignedBinary", IsUnsignedBinary,
+        "IsAnomalousAccessor", IsAnomalousAccessor
     ),
-    MITRETechniques = case(
-        Signal == "Lateral_Movement_Pattern", "T1078.002 (Valid Accounts: Domain Accounts), T1021 (Remote Services), T1570 (Lateral Tool Transfer)",
-        IsDomainController, "T1078.002 (Valid Accounts: Domain Accounts), T1021.002 (SMB/Windows Admin Shares)",
-        LogonType in ("10", "RemoteInteractive"), "T1021.001 (Remote Desktop Protocol)",
-        LogonType == "3", "T1021.002 (SMB/Windows Admin Shares)",
-        "T1078.002 (Valid Accounts: Domain Accounts), T1021 (Remote Services)"
+    
+    ThreatContext = pack(
+        "AttackType", case(
+            IsKnownDumpingTool, "Known Credential Dumping Tool",
+            DetectionMethod == "LSASS-Dump-File-Creation", "LSASS Memory Dump Creation",
+            DetectionMethod == "Dumping-Tool-Execution", "Dumping Tool Execution",
+            "Suspicious LSASS Access"
+        ),
+        "CommonTools", case(
+            AccessingProcess has "mimikatz", "Mimikatz",
+            AccessingProcess has "procdump", "ProcDump",
+            AccessingCommandLine has "comsvcs.dll", "DLL Injection (comsvcs)",
+            AccessingProcess =~ "taskmgr.exe", "Task Manager",
+            "Unknown/Custom Tool"
+        )
     ),
-    RecommendedActions = case(
-        AlertSeverity == "Critical", "IMMEDIATE: Isolate both source and target devices. Reset service account credentials. Investigate for Pass-the-Hash/Pass-the-Ticket. Check for data exfiltration and persistence mechanisms. Review all recent activity by this account.",
-        AlertSeverity == "High", "URGENT: Validate service account logon legitimacy. Check if account credentials are compromised. Review source device for malware. Investigate for lateral movement indicators. Consider credential reset if unauthorized.",
-        "Review logon context and validate against service account expected behavior. Check for configuration changes or new application deployments that might explain the activity."
-    )
+    
+    Recommendations = case(
+        AlertSeverity == "Critical",
+        "IMMEDIATE P0: 1) Isolate device from network 2) Terminate accessing process and all child processes 3) Force password reset for ALL users who logged on to this device 4) Capture memory dump for forensics 5) Hunt for lateral movement 6) Engage incident response team",
+        AlertSeverity == "High",
+        "URGENT: 1) Validate process legitimacy with user/system owner 2) If unauthorized, isolate device 3) Review recent logons to identify compromised accounts 4) Check for credential reuse across environment 5) Terminate suspicious process",
+        "INVESTIGATE: 1) Confirm authorized diagnostic/debugging activity 2) Validate user authorization for LSASS access 3) Review process execution context and justification"
+    ),
+    
+    DetectedTechniques = "T1003.001 (OS Credential Dumping: LSASS Memory), T1055 (Process Injection), T1106 (Native API)"
+
+// Filter to actionable alerts
+| where AlertSeverity in ("Critical", "High", "Medium")
+
 | project
-    TimeGenerated = coalesce(TimeGenerated, FirstLogon),
+    TimeGenerated,
+    DeviceName,
     AlertSeverity,
-    TotalRiskScore,
-    Signal,
-    ServiceAccount = strcat(AccountDomain, "\\", AccountName),
-    TargetDevice = coalesce(DeviceName, strcat(tostring(UniqueTargets), " devices")),
-    TargetDeviceCategory = coalesce(DeviceCategory, "Multiple"),
-    LogonType,
-    IsDomainController = coalesce(IsDomainController, HasDCTarget == 1),
-    IsPrivileged,
-    BaselineDeviceCount,
-    FailedAttempts,
-    UniqueTargets,
+    TotalRiskScore = AdjustedRiskScore,
+    AccessingAccount = strcat(AccessingDomain, "\\", AccessingAccount),
+    AccessingProcess,
+    AccessingProcessPath,
+    ThreatContext,
     Evidence,
-    MITRETechniques,
-    RecommendedActions
+    DetectedTechniques,
+    Recommendations
+
 | sort by TotalRiskScore desc, TimeGenerated desc
 
 references:
