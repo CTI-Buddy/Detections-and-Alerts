@@ -1,228 +1,178 @@
-# DE-HY25.15 Service Account Logon Anomaly Detection 
-id: DE-HY25.15
-title: Azure Security Center/Defender Modification Detection
+# DE-HY25.16 Kerberoasting Attack Detection
+id: DE-HY25.16
+title: Kerberoasting Attack Detection
 description: |
-  Detects a service account logging onto a device (especially a DC or workstation) it has 
-  no history of accessing, highly correlated with lateral movement attacks.
+  Detects a high-volume, rapid pattern of successful Kerberos Service Ticket requests (TGS), 
+  often using weak RC4 encryption, for multiple Service Principal Names (SPNs).
 severity: High
 status: draft
 author: \m/
-date_created: 2025-10-22
-date_modified: 2025-10-22
+date_created: 2025-10-27
+date_modified: 2025-10-27
 tags:
-  - clarifi_path: Endpoint/Windows/Lateral_Movement
-  - tactic: Lateral Movement
+  - clarifi_path: Endpoint/Windows/Credential_Access
   - tactic: Credential Access
-  - technique: Valid Accounts: Domain Accounts 
-  - technique: Remote Services
-  - technique: Lateral Tool Transfer
-  - ATT&CK_ID: T1078.002 # Valid Accounts: Domain Accounts
-  - ATT&CK_ID: T1021 # Remote Services
-  - ATT&CK_ID: T1570 # Lateral Tool Transfer   
-  - method: Correlation/Sequence
+  - technique: Steal or Forge Kerberos Tickets: Kerberoasting
+  - ATT&CK_ID: T1558.003 # Steal or Forge Kerberos Tickets: Kerberoasting
+  - method: Threshold/Count-Limit
   - method: Statistical/Baseline-Comparison
-  - method: Behavioral/Model-Classification
   - core_indicator: Event_AccountAnomaly
-  - core_indicator: Vol_LoginSpike
-  - core_indicator: Access_DomainController 
-  - datasource: DeviceInfo
-  - datasource: DeviceLogonEvents
-  - datasource: IdentityInfo
+  - core_indicator: Vol_RequestSpike
+  - core_indicator: Event_KRB_Event_ID 
+  - datasource: SecurityEvent
 
 logic:
   query: |
 
-// LSASS Credential Dumping Detection
-// Detects unauthorized memory access to LSASS.exe for credential harvesting
+// Kerberoasting Attack Detection
+// Detects mass service ticket (TGS) requests for offline password cracking
 
 // Parameters
-let DetectionWindow = 7d;
-let BaselineWindow = 30d;
-let TargetProcess = "lsass.exe";
+let DetectionWindow = 1h;        // Analysis window for volume detection
+let BaselineWindow = 30d;        // Historical baseline period
+let MinTickets = 10;             // Minimum unique SPNs for alert
+let MinTicketsForCritical = 20;  // Critical severity threshold
+let RC4_Encryption = "0x17";     // RC4-HMAC (weak, preferred by attackers)
 
-// Known credential dumping tools
-let CredentialDumpingTools = dynamic([
-    "mimikatz.exe", "mimilib.dll", "mimidrv.sys",
-    "procdump.exe", "procdump64.exe",
-    "dumpert.exe", "nanodump.exe",
-    "sqldumper.exe", "createdump.exe",
-    "out-minidump", "invoke-mimikatz",
-    "sharpdump.exe", "pypykatz",
-    "lsassy", "secretsdump"
+// Known legitimate high-volume SPN requesters (customize for your environment)
+let WhitelistedAccounts = dynamic([
+    "svc_monitor", "svc_scanner", "nagios", "solarwinds",
+    "SCCM_Server$", "monitoring_agent"
 ]);
 
-// Legitimate processes that may access LSASS (customize for your environment)
-let LegitimateAccessors = dynamic([
-    // Windows System Processes
-    "csrss.exe", "wininit.exe", "services.exe", "svchost.exe",
-    "lsm.exe", "smss.exe", "winlogon.exe", "logonui.exe",
-    // Security Software
-    "msmpeng.exe", "mpcmdrun.exe", "msseces.exe", "nissrv.exe",  // Windows Defender
-    "avp.exe", "kavtray.exe",                                     // Kaspersky
-    "mcshield.exe", "mfevtps.exe",                               // McAfee
-    "savservice.exe", "sophoshealth.exe",                        // Sophos
-    "ccsvchst.exe", "ccsvchst.exe",                              // Symantec
-    // EDR/Security Tools
-    "taniumclient.exe", "cb.exe", "sentinelone.exe",
-    "crowdstrike.exe", "falconsensor.exe",
-    // System Management
-    "wmiprvse.exe", "taskmgr.exe",
-    // Monitoring/Diagnostic (if approved)
-    "procexp.exe", "procexp64.exe", "procmon.exe", "procmon64.exe"  // Sysinternals (if authorized)
+// High-value/privileged SPN patterns (these are prime targets)
+let HighValueSPNPatterns = dynamic([
+    "MSSQLSvc", "HTTP", "HOST", "WSMAN", "TERMSRV", 
+    "RestrictedKrbHost", "LDAP", "DNS", "CIFS"
 ]);
 
-// Suspicious execution paths
-let SuspiciousPaths = dynamic([
-    "\\temp\\", "\\tmp\\", 
-    "\\appdata\\local\\temp\\", "\\appdata\\roaming\\",
-    "\\programdata\\", "\\public\\", "\\users\\public\\",
-    "\\downloads\\", "\\desktop\\",
-    "\\perflogs\\", "\\recycler\\", "\\recycle.bin\\",
-    "\\inetpub\\", "\\wwwroot\\"
-]);
-
-// High-privilege access rights for memory reading
-// Reference: https://docs.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights
-let DangerousAccessRights = dynamic([
-    "0x1410",     // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
-    "0x1fffff",   // PROCESS_ALL_ACCESS
-    "0x1000",     // PROCESS_QUERY_LIMITED_INFORMATION  
-    "0x0010",     // PROCESS_VM_READ
-    "0x0400",     // PROCESS_QUERY_INFORMATION
-    "0x0800"      // PROCESS_SUSPEND_RESUME
-]);
-
-// Get baseline of LSASS access patterns
-let LsassAccessBaseline =
-    DeviceEvents
+// Get baseline of normal SPN request patterns
+let KerberoastingBaseline = 
+    SecurityEvent
     | where TimeGenerated between (ago(BaselineWindow) .. ago(DetectionWindow))
-    | where ActionType == "OpenProcessApiCall"
-    | where FileName =~ TargetProcess or ProcessCommandLine has TargetProcess
+    | where EventID == 4769  // Kerberos Service Ticket granted
+    | where Status == "0x0"  // Successful requests only
     | summarize 
-        BaselineAccessCount = count(),
-        BaselineAccessors = make_set(InitiatingProcessFileName)
-    by DeviceName;
+        BaselineSPNCount = dcount(ServiceName),
+        BaselineAvgPerHour = count() / (BaselineWindow / 1h),
+        BaselineRequesters = make_set(Account)
+    by Account;
 
-// Module 1: Direct Process Access Events (Primary Detection)
-let DirectLsassAccess = DeviceEvents
+// Main Detection: Service Ticket Request Analysis
+let ServiceTicketRequests = SecurityEvent
 | where TimeGenerated >= ago(DetectionWindow)
-| where ActionType in ("OpenProcessApiCall", "ProcessAccess", "SetThreadContextRemoteApiCall")
-// Target process is LSASS
-| where FileName =~ TargetProcess 
-    or ProcessCommandLine has TargetProcess
-    or AdditionalFields has TargetProcess
+| where EventID == 4769  // Kerberos Service Ticket was granted
+| where Status == "0x0"  // Only successful ticket grants
 | extend
-    AccessingProcess = InitiatingProcessFileName,
-    AccessingProcessPath = tolower(InitiatingProcessFolderPath),
-    AccessingCommandLine = InitiatingProcessCommandLine,
-    AccessingParentProcess = InitiatingProcessParentFileName,
-    AccessMask = tostring(AdditionalFields.DesiredAccess),
-    TargetProcessId = ProcessId,
-    AccessingAccount = InitiatingProcessAccountName,
-    AccessingDomain = InitiatingProcessAccountDomain
+    // Correct field mappings for Event ID 4769
+    ClientAccount = Account,                    // Requesting account
+    ServiceName = ServiceName,                  // The SPN being requested
+    ServiceAccount = TargetUserName,            // Account that owns the SPN
+    TicketEncryptionType = TicketEncryptionType, // Encryption used
+    ClientIP = IpAddress,
+    DomainController = Computer,
+    TicketOptions = TicketOptions,
+    Status = Status
+// Filter out known good accounts
+| where ClientAccount !in~ (WhitelistedAccounts)
+| where ClientAccount !in ("ANONYMOUS LOGON", "GUEST", "")
+// Key Kerberoasting indicator: RC4 encryption (weak, crackable)
 | extend
-    // Detection flags
-    IsKnownDumpingTool = AccessingProcess has_any (CredentialDumpingTools) 
-        or AccessingCommandLine has_any (CredentialDumpingTools),
-    IsLegitimateAccessor = AccessingProcess in~ (LegitimateAccessors),
-    IsFromSuspiciousPath = AccessingProcessPath has_any (SuspiciousPaths),
-    HasDangerousAccessRights = AccessMask has_any (DangerousAccessRights) or AccessMask == "",  // Empty often means full access
-    IsUnsignedBinary = isempty(InitiatingProcessVersionInfoOriginalFileName) or InitiatingProcessVersionInfoOriginalFileName == "",
-    IsScriptingEngine = AccessingProcess in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe"),
-    IsOffHours = hourofday(TimeGenerated) not between (7 .. 19)  // Outside business hours
-| where not(IsLegitimateAccessor)  // Filter known good
-| extend DetectionMethod = "Direct-Process-Access";
+    IsRC4Encryption = TicketEncryptionType =~ RC4_Encryption,
+    IsHighValueSPN = ServiceName has_any (HighValueSPNPatterns),
+    IsComputerAccount = ClientAccount endswith "$",
+    IsServiceAccount = ClientAccount startswith "svc" or ClientAccount startswith "svc_"
+| project TimeGenerated, ClientAccount, ServiceName, ServiceAccount, 
+          TicketEncryptionType, IsRC4Encryption, IsHighValueSPN, 
+          ClientIP, DomainController, IsComputerAccount, IsServiceAccount;
 
-// Module 2: LSASS Memory Dump File Creation
-let LsassDumpFiles = DeviceFileEvents
-| where TimeGenerated >= ago(DetectionWindow)
-| where ActionType in ("FileCreated", "FileRenamed")
-| where FileName endswith ".dmp" 
-    or FileName has "lsass"
-    or FileName matches regex @"(?i)lsass.*\.dmp$"
-    or FileName matches regex @"(?i).*dump.*\.dmp$"
+// Aggregate by client account to detect volume anomalies
+let KerberoastingActivity = ServiceTicketRequests
+| summarize
+    // Core metrics
+    UniqueSPNs = dcount(ServiceName),
+    UniqueServiceAccounts = dcount(ServiceAccount),
+    TotalRequests = count(),
+    FirstRequest = min(TimeGenerated),
+    LastRequest = max(TimeGenerated),
+    // Collections for evidence
+    SPNsRequested = make_set(ServiceName, 50),
+    ServiceAccountsTargeted = make_set(ServiceAccount, 50),
+    SourceIPs = make_set(ClientIP),
+    DomainControllers = make_set(DomainController),
+    // Risk indicators
+    RC4RequestCount = countif(IsRC4Encryption),
+    HighValueSPNCount = countif(IsHighValueSPN),
+    RC4Percentage = round(100.0 * countif(IsRC4Encryption) / count(), 1),
+    HighValuePercentage = round(100.0 * countif(IsHighValueSPN) / count(), 1)
+by ClientAccount, IsComputerAccount, IsServiceAccount
+| where UniqueSPNs >= MinTickets  // Volume threshold
 | extend
-    AccessingProcess = InitiatingProcessFileName,
-    AccessingProcessPath = tolower(InitiatingProcessFolderPath),
-    AccessingCommandLine = InitiatingProcessCommandLine,
-    AccessingParentProcess = InitiatingProcessParentFileName,
-    DumpFilePath = FolderPath,
-    AccessingAccount = InitiatingProcessAccountName,
-    AccessingDomain = InitiatingProcessAccountDomain
-| extend
-    IsKnownDumpingTool = AccessingProcess has_any (CredentialDumpingTools),
-    IsLegitimateAccessor = AccessingProcess in~ (LegitimateAccessors),
-    IsFromSuspiciousPath = AccessingProcessPath has_any (SuspiciousPaths) or DumpFilePath has_any (SuspiciousPaths),
-    HasDangerousAccessRights = true,  // Creating dump file implies access
-    IsUnsignedBinary = isempty(InitiatingProcessVersionInfoOriginalFileName),
-    IsScriptingEngine = AccessingProcess in~ ("powershell.exe", "pwsh.exe", "cmd.exe"),
-    IsOffHours = hourofday(TimeGenerated) not between (7 .. 19)
-| where not(IsLegitimateAccessor)
-| extend DetectionMethod = "LSASS-Dump-File-Creation";
+    ActivityDuration = datetime_diff('second', LastRequest, FirstRequest),
+    RequestRate = round(todouble(TotalRequests) / (datetime_diff('minute', LastRequest, FirstRequest) + 1), 2);
 
-// Module 3: Task Manager / Debugging Tools (Context-Aware)
-let TaskManagerDump = DeviceProcessEvents
-| where TimeGenerated >= ago(DetectionWindow)
-| where FileName =~ "taskmgr.exe" and ProcessCommandLine has "lsass"
-    or (FileName in~ ("procdump.exe", "procdump64.exe") and ProcessCommandLine has "lsass")
-    or (FileName =~ "rundll32.exe" and ProcessCommandLine has_any ("MiniDumpW", "comsvcs.dll"))
+// Join with baseline for anomaly detection
+KerberoastingActivity
+| join kind=leftouter (KerberoastingBaseline) on $left.ClientAccount == $right.Account
 | extend
-    AccessingProcess = FileName,
-    AccessingProcessPath = tolower(FolderPath),
-    AccessingCommandLine = ProcessCommandLine,
-    AccessingParentProcess = InitiatingProcessParentFileName,
-    AccessingAccount = AccountName,
-    AccessingDomain = AccountDomain
-| extend
-    IsKnownDumpingTool = AccessingProcess has_any (CredentialDumpingTools) 
-        or AccessingCommandLine has "comsvcs.dll",  // Classic DLL injection technique
-    IsLegitimateAccessor = false,  // These need validation
-    IsFromSuspiciousPath = AccessingProcessPath has_any (SuspiciousPaths),
-    HasDangerousAccessRights = true,
-    IsUnsignedBinary = false,
-    IsScriptingEngine = false,
-    IsOffHours = hourofday(TimeGenerated) not between (7 .. 19)
-| extend DetectionMethod = "Dumping-Tool-Execution";
+    IsNewRequester = isnull(BaselineSPNCount) or BaselineSPNCount < 3,
+    VolumeAnomaly = iif(BaselineSPNCount > 0, 
+        todouble(UniqueSPNs) / BaselineSPNCount, 
+        todouble(UniqueSPNs)),
+    IsAnomalousVolume = VolumeAnomaly > 5.0 or IsNewRequester
 
-// Combine all detection methods
-let AllLsassAccess = union isfuzzy=true DirectLsassAccess, LsassDumpFiles, TaskManagerDump;
-
-// Risk Scoring and Analysis
-AllLsassAccess
+// Enhanced Risk Scoring
 | extend
-    // Base risk by detection method
-    MethodRisk = case(
-        DetectionMethod == "LSASS-Dump-File-Creation", 40,  // Creating dump is direct evidence
-        DetectionMethod == "Dumping-Tool-Execution", 35,    // Known tool usage
-        DetectionMethod == "Direct-Process-Access", 30,     // Process access attempt
-        20
-    ),
-    
-    // Tool/process risk
-    ToolRisk = case(
-        IsKnownDumpingTool, 35,                   // Known credential dumping tool
-        AccessingProcess in~ ("procdump.exe", "procdump64.exe", "taskmgr.exe"), 25,  // Dumping capability
-        AccessingProcess =~ "rundll32.exe", 20,   // Common LOLBAS
-        IsScriptingEngine, 15,                    // Scripting wrapper
+    // Base volume risk
+    VolumeRisk = case(
+        UniqueSPNs >= MinTicketsForCritical, 40,  // 20+ SPNs
+        UniqueSPNs >= 15, 30,                     // 15-19 SPNs
+        UniqueSPNs >= MinTickets, 20,             // 10-14 SPNs
         10
     ),
     
-    // Context risk
-    ContextRisk = case(
-        IsFromSuspiciousPath and IsUnsignedBinary, 25,  // Suspicious path + unsigned
-        IsFromSuspiciousPath, 20,                       // Suspicious execution location
-        IsUnsignedBinary, 15,                           // Unsigned binary
-        IsOffHours, 10,                                 // Off-hours access
+    // Encryption risk (RC4 is highly suspicious)
+    EncryptionRisk = case(
+        RC4Percentage >= 80, 30,      // Mostly RC4 (classic Kerberoasting)
+        RC4Percentage >= 50, 20,      // Half RC4
+        RC4RequestCount > 0, 10,      // Some RC4
+        0
+    ),
+    
+    // Target value risk
+    TargetRisk = case(
+        HighValuePercentage >= 50, 15,  // Targeting high-value SPNs
+        HighValueSPNCount >= 5, 10,     // Multiple high-value targets
+        HighValueSPNCount > 0, 5,       // Some high-value targets
+        0
+    ),
+    
+    // Speed/pattern risk
+    BehaviorRisk = case(
+        ActivityDuration <= 300 and UniqueSPNs >= 15, 20,  // Very fast, high volume
+        ActivityDuration <= 600 and UniqueSPNs >= 10, 15,  // Fast enumeration
+        RequestRate > 10, 10,                               // High request rate
+        array_length(SourceIPs) > 1, 10,                   // Multiple source IPs
         5
     ),
     
-    // Access rights risk
-    AccessRisk = case(
-        HasDangerousAccessRights, 10,  // Has memory read capability
-        5
+    // Anomaly risk
+    AnomalyRisk = case(
+        IsNewRequester and UniqueSPNs >= 15, 15,  // New requester, high volume
+        VolumeAnomaly > 10, 15,                   // 10x baseline
+        VolumeAnomaly > 5, 10,                    // 5x baseline  
+        IsNewRequester, 5,                        // First time requester
+        0
     ),
     
-    TotalRiskScore = MethodRisk + ToolRisk + ContextRisk + AccessRisk
+    // Account type adjustments
+    AccountTypeModifier = case(
+        IsComputerAccount == false and IsServiceAccount == false, 10,  // User account (unusual)
+        IsComputerAccount, 5,   // Computer account (compromised machine)
+        0                       // Service account (could be legitimate or compromised)
+    ),
+    
+    TotalRiskScore = VolumeRisk + EncryptionRisk + TargetRisk + BehaviorRisk + AnomalyRisk + AccountTypeModifier
 
 | extend
     AlertSeverity = case(
@@ -232,103 +182,128 @@ AllLsassAccess
         "Low"
     )
 
-// Join with baseline for anomaly detection
-| join kind=leftouter (LsassAccessBaseline) on DeviceName
-| extend
-    IsAnomalousAccessor = not(BaselineAccessors has AccessingProcess),
-    AdjustedRiskScore = TotalRiskScore + iff(IsAnomalousAccessor, 15, 0)
+// Filter to actionable alerts
+| where AlertSeverity in ("Critical", "High", "Medium")
 
 | extend
     Evidence = pack(
-        "DetectionMethod", DetectionMethod,
-        "AccessingProcess", AccessingProcess,
-        "AccessingProcessPath", AccessingProcessPath,
-        "AccessingCommandLine", AccessingCommandLine,
-        "ParentProcess", AccessingParentProcess,
-        "AccessMask", AccessMask,
-        "TargetProcessId", TargetProcessId,
-        "IsKnownDumpingTool", IsKnownDumpingTool,
-        "IsFromSuspiciousPath", IsFromSuspiciousPath,
-        "IsUnsignedBinary", IsUnsignedBinary,
-        "IsAnomalousAccessor", IsAnomalousAccessor
+        "UniqueSPNs", UniqueSPNs,
+        "UniqueServiceAccounts", UniqueServiceAccounts,
+        "TotalRequests", TotalRequests,
+        "ActivityDuration", ActivityDuration,
+        "RequestRate", RequestRate,
+        "RC4Percentage", RC4Percentage,
+        "HighValueSPNCount", HighValueSPNCount,
+        "SPNsSample", array_slice(SPNsRequested, 0, 10),  // First 10 for readability
+        "ServiceAccountsSample", array_slice(ServiceAccountsTargeted, 0, 10),
+        "SourceIPs", SourceIPs,
+        "VolumeAnomaly", VolumeAnomaly,
+        "IsNewRequester", IsNewRequester
     ),
     
     ThreatContext = pack(
-        "AttackType", case(
-            IsKnownDumpingTool, "Known Credential Dumping Tool",
-            DetectionMethod == "LSASS-Dump-File-Creation", "LSASS Memory Dump Creation",
-            DetectionMethod == "Dumping-Tool-Execution", "Dumping Tool Execution",
-            "Suspicious LSASS Access"
+        "AttackType", "Kerberoasting",
+        "AttackPhase", "Credential Access - Offline Password Cracking Preparation",
+        "KeyIndicators", strcat_array(
+            dynamic([
+                iff(RC4Percentage >= 80, "High RC4 Usage", ""),
+                iff(HighValueSPNCount >= 5, "High-Value Targets", ""),
+                iff(ActivityDuration <= 600, "Rapid Enumeration", ""),
+                iff(IsNewRequester, "New Requester", ""),
+                iff(VolumeAnomaly > 5, "Volume Anomaly", "")
+            ]) | where strlen(tostring($0)) > 0,
+            ", "
         ),
-        "CommonTools", case(
-            AccessingProcess has "mimikatz", "Mimikatz",
-            AccessingProcess has "procdump", "ProcDump",
-            AccessingCommandLine has "comsvcs.dll", "DLL Injection (comsvcs)",
-            AccessingProcess =~ "taskmgr.exe", "Task Manager",
-            "Unknown/Custom Tool"
+        "RiskBreakdown", pack(
+            "VolumeRisk", VolumeRisk,
+            "EncryptionRisk", EncryptionRisk,
+            "TargetRisk", TargetRisk,
+            "BehaviorRisk", BehaviorRisk,
+            "AnomalyRisk", AnomalyRisk
         )
     ),
     
     Recommendations = case(
         AlertSeverity == "Critical",
-        "IMMEDIATE P0: 1) Isolate device from network 2) Terminate accessing process and all child processes 3) Force password reset for ALL users who logged on to this device 4) Capture memory dump for forensics 5) Hunt for lateral movement 6) Engage incident response team",
+        "IMMEDIATE P0: 1) Disable ClientAccount 2) Force password reset for ALL targeted service accounts (25+ char, complex) 3) Review authentication logs for credential reuse 4) Hunt for lateral movement 5) Check for AS-REP roasting and other Kerberos attacks 6) Consider implementing AES encryption for all SPNs",
         AlertSeverity == "High",
-        "URGENT: 1) Validate process legitimacy with user/system owner 2) If unauthorized, isolate device 3) Review recent logons to identify compromised accounts 4) Check for credential reuse across environment 5) Terminate suspicious process",
-        "INVESTIGATE: 1) Confirm authorized diagnostic/debugging activity 2) Validate user authorization for LSASS access 3) Review process execution context and justification"
+        "URGENT: 1) Validate ClientAccount activity authorization 2) If unauthorized, disable account 3) Reset passwords for high-value service accounts 4) Review SPN configurations 5) Check for weak encryption types 6) Monitor for offline cracking attempts",
+        "INVESTIGATE: 1) Confirm legitimate security scanning or monitoring 2) Validate service account necessity 3) Review SPN request patterns 4) Consider implementing honeypot SPNs"
     ),
     
-    DetectedTechniques = "T1003.001 (OS Credential Dumping: LSASS Memory), T1055 (Process Injection), T1106 (Native API)"
+    DetectedTechniques = "T1558.003 (Steal or Forge Kerberos Tickets: Kerberoasting), T1558 (Steal or Forge Kerberos Tickets)"
 
-// Filter to actionable alerts
-| where AlertSeverity in ("Critical", "High", "Medium")
+// Additional context for response
+| extend
+    RemediationSteps = pack(
+        "ImmediateActions", dynamic([
+            "Disable attacking account",
+            "Reset passwords for all targeted service accounts",
+            "Force minimum 25-character passwords with complexity"
+        ]),
+        "ForensicActions", dynamic([
+            "Review Kerberos ticket requests (Event IDs 4768, 4769, 4770, 4771)",
+            "Check for TGT requests (AS-REP roasting - Event ID 4768 with PreAuth = No)",
+            "Hunt for password spray attempts",
+            "Review failed authentication events for offline cracking validation"
+        ]),
+        "PreventionActions", dynamic([
+            "Implement AES encryption for all SPNs (disable RC4)",
+            "Deploy honeypot service accounts with alerts",
+            "Enforce strong service account passwords (25+ characters)",
+            "Reduce number of accounts with SPNs",
+            "Implement privileged access management (PAM) for service accounts",
+            "Enable Advanced Threat Analytics or Azure ATP"
+        ])
+    )
 
 | project
-    TimeGenerated,
-    DeviceName,
+    TimeGenerated = LastRequest,
     AlertSeverity,
-    TotalRiskScore = AdjustedRiskScore,
-    AccessingAccount = strcat(AccessingDomain, "\\", AccessingAccount),
-    AccessingProcess,
-    AccessingProcessPath,
+    TotalRiskScore,
+    ClientAccount,
+    AccountType = case(
+        IsComputerAccount, "Computer Account",
+        IsServiceAccount, "Service Account",
+        "User Account"
+    ),
+    UniqueSPNs,
+    UniqueServiceAccounts,
+    TotalRequests,
+    ActivityDurationSeconds = ActivityDuration,
+    RC4Percentage,
+    HighValueSPNCount,
     ThreatContext,
     Evidence,
     DetectedTechniques,
-    Recommendations
+    Recommendations,
+    RemediationSteps
 
 | sort by TotalRiskScore desc, TimeGenerated desc
 
 references:
-  - https://attack.mitre.org/techniques/T1078/002/
-  - https://attack.mitre.org/techniques/T1021/
-  - https://attack.mitre.org/techniques/T1570/
-  - https://web-assets.esetstatic.com/wls/2019/10/ESET_Operation_Ghost_Dukes.pdf
-  - https://cloud.google.com/blog/topics/threat-intelligence/suspected-apt-actors-leverage-bypass-techniques-pulse-secure-zero-day/
-  - https://web.archive.org/web/20230218064220/https://research.nccgroup.com/2021/01/12/abusing-cloud-services-to-fly-under-the-radar/
-  - https://thehackernews.com/2024/09/wherever-theres-ransomware-theres.html
+  - https://attack.mitre.org/techniques/T1558/003/
+  - https://cloud.google.com/blog/topics/threat-intelligence/unc2165-shifts-to-evade-sanctions/
+  - https://www.cisa.gov/news-events/cybersecurity-advisories/aa24-190a
+  - https://www.microsoft.com/en-us/security/blog/2021/01/20/deep-dive-into-the-solorigate-second-stage-activation-from-sunburst-to-teardrop-and-raindrop/
+  - https://thedfirreport.com/2020/11/05/ryuk-speed-run-2-hours-to-ransom/
 
 triage: |
-  This alert means a service account is logging onto a host it has never accessed before, potentially using compromised credentials (Pass-the-Hash/Ticket, or credential harvesting).
-    1. IMMEDIATE Containment & Account Disruption
-      •	Identify Compromised Account: Record the ServiceAccount.
-      •	Isolate Target/Source: Immediately isolate the TargetDevice and any devices listed in TargetDevices (if a Lateral Movement Pattern) and, if the source is known, isolate the source device to stop the spread.
-      •	Invalidate Credential (CRITICAL):
-        o	If possible, force a password change (long, complex) for the ServiceAccount.
-        o	If a gMSA/MSA, investigate the recent key retrieval and update its permissions, or temporarily suspend its usage.
-        o	Revoke all Kerberos tickets and force a logoff for the account across all domain controllers.
-    2. Forensic Scoping on Target Devices
-      •	DC Access: If the alert involved a Domain Controller target, prioritize a full forensic memory and disk analysis of that DC immediately, as the attacker likely retrieved the NTDS.dit or golden ticket material.
-      •	Target Activity: On the TargetDevice (and all devices in TargetDevices):
-        o	Review all logons immediately following the anomalous logon for processes spawned by the service account.
-        o	Look for execution of credential dumping tools (e.g., Mimikatz, Procdump).
-        o	Look for signs of data staging or tool transfer (net use, Admin shares access).
-    3. Credential Compromise Root Cause
-      •	Source Device Investigation: If a SourceDevice is identified (or if the logon originated from a Workstation), investigate that machine for the root cause:
-        o	Was it infected with a keylogger or malware?
-        o	Was a local credential dump performed on that device?
-        o	If the service account logs onto the source device legitimately, that device is the probable point of initial credential compromise.
-      •	Failed Logons/Velocity Check: Use the FailedAttempts and IsSprayPattern flags to confirm the attack type. High failed counts suggest brute force or spraying; a high RapidLogonCount suggests an automated script (like a worm or a built-in attack tool).
+  This alert means an attacker has successfully harvested credentials for offline password cracking, which can lead to rapid lateral movement.
+    1. Immediate Attacker Account Containment
+      •	Disable/Isolate Account: Immediately disable or force a high-complexity password reset for the ClientAccount (the attacking source account) to halt the enumeration attack.
+      •	Review Source: If available in the Evidence, check the source SourceIPs for malware or further malicious activity; this is the device where the attacker has a foothold.
+    2. Targeted Service Account Remediation (Highest Priority)
+      •	Identify Targets: Retrieve the full list of Service Accounts (ServiceAccountsTargeted) and prioritize the accounts matching the HighValueSPNCount.
+      •	Force Password Reset (CRITICAL): Immediately force a password reset for all targeted service accounts. Crucially, enforce a minimum length of 25 characters and complexity for these accounts to make offline cracking infeasible.
+      •	Review Encryption: Review the Kerberos properties for the targeted SPNs. If the RC4Percentage is high, work with Identity/Domain Admins to enforce AES encryption for the affected SPNs to prevent future Kerberoasting.
+    3. Domain and Network Scoping
+      •	Check for Lateral Movement: Search authentication logs for the targeted Service Accounts (those just reset) for any logon attempts occurring after the Kerberoasting alert. This checks if the attacker has already cracked and reused the passwords.
+      •	Hunt for Parallel Attacks: Check the Domain Controller logs for related Kerberos events from the ClientAccount, such as:
+        o	AS-REP Roasting: Check for Event ID 4768 (TGT Request) where Pre-Authentication is not used on non-user accounts.
+        o	Ticket Injection: Hunt for the attacker importing their own tickets (Event ID 4624 with suspicious Logon Type).
     4. Escalation
-      •	Escalate: Confirm the incident as a breach involving Lateral Movement and Credential Access. Escalations team should coordinate a domain-wide check for other compromised accounts and ensure the service account is no longer usable by the attacker.
+      •	Escalate: Confirm the incident as a breach involving T1558.003 (Kerberoasting) and coordinate with the Identity/Domain teams to ensure all targeted accounts are secured and long-term Kerberos protection is enforced.
 
 notes: |
-  - I attempted an off hours piece of this but frankly that's probably not going to work for this environment.  Be progressive about cutting it off early if it can'be be salvaged.
+  - check
