@@ -1,309 +1,233 @@
-# DE-HY25.16 Kerberoasting Attack Detection
-id: DE-HY25.16
-title: Kerberoasting Attack Detection
-description: |
-  Detects a high-volume, rapid pattern of successful Kerberos Service Ticket requests (TGS), 
-  often using weak RC4 encryption, for multiple Service Principal Names (SPNs).
-severity: High
-status: draft
-author: \m/
-date_created: 2025-10-27
-date_modified: 2025-10-27
-tags:
-  - clarifi_path: Endpoint/Windows/Credential_Access
-  - tactic: Credential Access
-  - technique: Steal or Forge Kerberos Tickets: Kerberoasting
-  - ATT&CK_ID: T1558.003 # Steal or Forge Kerberos Tickets: Kerberoasting
-  - method: Threshold/Count-Limit
-  - method: Statistical/Baseline-Comparison
-  - core_indicator: Event_AccountAnomaly
-  - core_indicator: Vol_RequestSpike
-  - core_indicator: Event_KRB_Event_ID 
-  - datasource: SecurityEvent
-
-logic:
-  query: |
-
-// Kerberoasting Attack Detection
-// Detects mass service ticket (TGS) requests for offline password cracking
+// Certutil LOLBAS Abuse Detection
+// Detects malicious use of certutil.exe for file downloads, encoding, and reconnaissance
 
 // Parameters
-let DetectionWindow = 1h;        // Analysis window for volume detection
-let BaselineWindow = 30d;        // Historical baseline period
-let MinTickets = 10;             // Minimum unique SPNs for alert
-let MinTicketsForCritical = 20;  // Critical severity threshold
-let RC4_Encryption = "0x17";     // RC4-HMAC (weak, preferred by attackers)
+let DetectionWindow = 1d;
+let BaselineWindow = 30d;
+let CertutilBinary = "certutil.exe";
 
-// Known legitimate high-volume SPN requesters (customize for your environment)
-let WhitelistedAccounts = dynamic([
-    "svc_monitor", "svc_scanner", "nagios", "solarwinds",
-    "SCCM_Server$", "monitoring_agent"
+// High-risk certutil operations (common in attacks)
+let MaliciousFlags = dynamic([
+    "-urlcache",     // Download files from URL
+    "-f",            // Force overwrite (often with -urlcache)
+    "-split",        // Split file (data staging)
+    "-encode",       // Encode file (obfuscation)
+    "-decode",       // Decode file (deobfuscation)
+    "-ping",         // Network connectivity check
+    "-verifyctl",    // Can be used for downloads
+    "-syncwithwu"    // Windows Update sync abuse
 ]);
 
-// High-value/privileged SPN patterns (these are prime targets)
-let HighValueSPNPatterns = dynamic([
-    "MSSQLSvc", "HTTP", "HOST", "WSMAN", "TERMSRV", 
-    "RestrictedKrbHost", "LDAP", "DNS", "CIFS"
+// Additional suspicious patterns
+let SuspiciousPatterns = dynamic([
+    "http://", "https://", "ftp://",  // Network URLs
+    ".txt", ".ps1", ".exe", ".dll", ".bat", ".vbs", ".js",  // Common payload extensions
+    "admin$", "c$", "ipc$",  // SMB shares
+    "\\\\", "127.0.0.1", "localhost"  // Network paths
 ]);
 
-// Get baseline of normal SPN request patterns
-let KerberoastingBaseline = 
-    SecurityEvent
-    | where TimeGenerated between (ago(BaselineWindow) .. ago(DetectionWindow))
-    | where EventID == 4769  // Kerberos Service Ticket granted
-    | where Status == "0x0"  // Successful requests only
-    | summarize 
-        BaselineSPNCount = dcount(ServiceName),
-        BaselineAvgPerHour = count() / (BaselineWindow / 1h),
-        BaselineRequesters = make_set(Account)
-    by Account;
+// Suspicious execution paths
+let SuspiciousPaths = dynamic([
+    "\\temp\\", "\\tmp\\",
+    "\\appdata\\local\\temp\\", "\\appdata\\roaming\\",
+    "\\programdata\\", "\\public\\", "\\users\\public\\",
+    "\\downloads\\", "\\desktop\\",
+    "\\perflogs\\", "\\recycler\\", "\\recycle.bin\\",
+    "\\inetpub\\wwwroot\\", "\\inetpub\\temp\\"
+]);
 
-// Main Detection: Service Ticket Request Analysis
-let ServiceTicketRequests = SecurityEvent
+// Legitimate certutil usage patterns (certificate management)
+let LegitimateOperations = dynamic([
+    "-addstore", "-delstore", "-viewstore",  // Certificate store operations
+    "-enterprise", "-user", "-grouppolicy",  // Certificate policy
+    "-installcert", "-deletecert",           // Certificate installation
+    "-crl", "-verify"                        // Certificate verification
+]);
+
+// Get baseline of certutil usage (ALL usage, not just legitimate)
+let CertutilBaseline = DeviceProcessEvents
+| where TimeGenerated between (ago(BaselineWindow) .. ago(DetectionWindow))
+| where FileName =~ CertutilBinary
+| extend ExecPathNormalized = tolower(FolderPath)
+| summarize 
+    BaselineExecutions = count(),
+    KnownPaths = make_set(tolower(FolderPath)),
+    CommandPatterns = make_set(ProcessCommandLine, 10),
+    LastSeenBefore = max(TimeGenerated)
+by AccountName;
+
+// Main Detection: Current certutil activity
+let CertutilActivity = DeviceProcessEvents
 | where TimeGenerated >= ago(DetectionWindow)
-| where EventID == 4769  // Kerberos Service Ticket was granted
-| where Status == "0x0"  // Only successful ticket grants
+| where FileName =~ CertutilBinary
 | extend
-    // Correct field mappings for Event ID 4769
-    ClientAccount = Account,                    // Requesting account
-    ServiceName = ServiceName,                  // The SPN being requested
-    ServiceAccount = TargetUserName,            // Account that owns the SPN
-    TicketEncryptionType = TicketEncryptionType, // Encryption used
-    ClientIP = IpAddress,
-    DomainController = Computer,
-    TicketOptions = TicketOptions,
-    Status = Status
-// Filter out known good accounts
-| where ClientAccount !in~ (WhitelistedAccounts)
-| where ClientAccount !in ("ANONYMOUS LOGON", "GUEST", "")
-// Key Kerberoasting indicator: RC4 encryption (weak, crackable)
+    CommandLine = ProcessCommandLine,
+    CommandLineLower = tolower(ProcessCommandLine),
+    ExecPath = FolderPath,
+    ExecPathLower = tolower(FolderPath),
+    ParentProcess = InitiatingProcessFileName,
+    ParentCommandLine = InitiatingProcessCommandLine,
+    Account = AccountName,
+    Domain = AccountDomain
 | extend
-    IsRC4Encryption = TicketEncryptionType =~ RC4_Encryption,
-    IsHighValueSPN = ServiceName has_any (HighValueSPNPatterns),
-    IsComputerAccount = ClientAccount endswith "$",
-    IsServiceAccount = ClientAccount startswith "svc" or ClientAccount startswith "svc_"
-| project TimeGenerated, ClientAccount, ServiceName, ServiceAccount, 
-          TicketEncryptionType, IsRC4Encryption, IsHighValueSPN, 
-          ClientIP, DomainController, IsComputerAccount, IsServiceAccount;
+    // Detection flags
+    HasMaliciousFlags = CommandLineLower has_any (MaliciousFlags),
+    HasSuspiciousPatterns = CommandLineLower has_any (SuspiciousPatterns),
+    IsLegitimateOperation = CommandLineLower has_any (LegitimateOperations),
+    IsFromSuspiciousPath = ExecPathLower has_any (SuspiciousPaths),
+    
+    // Extract specific indicators
+    HasURLCache = CommandLineLower has "-urlcache",
+    HasEncodeDecode = CommandLineLower has "-encode" or CommandLineLower has "-decode",
+    HasNetworkURL = CommandLineLower matches regex @"https?://[^\s]+",
+    
+    // Extract URL if present
+    ExtractedURL = extract(@"(https?://[^\s]+)", 1, CommandLine),
+    
+    // Parent process risk
+    IsSuspiciousParent = ParentProcess in~ ("cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe"),
+    
+    // Timing
+    IsOffHours = hourofday(TimeGenerated) not between (7 .. 18);
 
-// Aggregate by client account to detect volume anomalies
-let KerberoastingActivity = ServiceTicketRequests
-| summarize
-    // Core metrics
-    UniqueSPNs = dcount(ServiceName),
-    UniqueServiceAccounts = dcount(ServiceAccount),
-    TotalRequests = count(),
-    FirstRequest = min(TimeGenerated),
-    LastRequest = max(TimeGenerated),
-    // Collections for evidence
-    SPNsRequested = make_set(ServiceName, 50),
-    ServiceAccountsTargeted = make_set(ServiceAccount, 50),
-    SourceIPs = make_set(ClientIP),
-    DomainControllers = make_set(DomainController),
-    // Risk indicators
-    RC4RequestCount = countif(IsRC4Encryption),
-    HighValueSPNCount = countif(IsHighValueSPN),
-    RC4Percentage = round(100.0 * countif(IsRC4Encryption) / count(), 1),
-    HighValuePercentage = round(100.0 * countif(IsHighValueSPN) / count(), 1)
-by ClientAccount, IsComputerAccount, IsServiceAccount
-| where UniqueSPNs >= MinTickets  // Volume threshold
+// Join with baseline
+CertutilActivity
+| join kind=leftouter (CertutilBaseline) on $left.Account == $right.AccountName
 | extend
-    ActivityDuration = datetime_diff('second', LastRequest, FirstRequest),
-    RequestRate = round(todouble(TotalRequests) / (datetime_diff('minute', LastRequest, FirstRequest) + 1), 2);
+    HasBaseline = isnotnull(BaselineExecutions),
+    IsNewUser = isnull(BaselineExecutions) or BaselineExecutions < 2,
+    IsNewPath = not(KnownPaths has ExecPathLower),
+    DaysSinceLastSeen = datetime_diff('day', TimeGenerated, LastSeenBefore),
+    FrequencyAnomaly = iif(BaselineExecutions > 0, 
+        todouble(1) / BaselineExecutions * 100, 
+        100.0)  // New user = 100% anomaly
 
-// Join with baseline for anomaly detection
-KerberoastingActivity
-| join kind=leftouter (KerberoastingBaseline) on $left.ClientAccount == $right.Account
-| extend
-    IsNewRequester = isnull(BaselineSPNCount) or BaselineSPNCount < 3,
-    VolumeAnomaly = iif(BaselineSPNCount > 0, 
-        todouble(UniqueSPNs) / BaselineSPNCount, 
-        todouble(UniqueSPNs)),
-    IsAnomalousVolume = VolumeAnomaly > 5.0 or IsNewRequester
+// Filter to suspicious activity only
+| where HasMaliciousFlags or (HasSuspiciousPatterns and not(IsLegitimateOperation))
 
 // Enhanced Risk Scoring
 | extend
-    // Base volume risk
-    VolumeRisk = case(
-        UniqueSPNs >= MinTicketsForCritical, 40,  // 20+ SPNs
-        UniqueSPNs >= 15, 30,                     // 15-19 SPNs
-        UniqueSPNs >= MinTickets, 20,             // 10-14 SPNs
+    // Base operation risk
+    OperationRisk = case(
+        HasURLCache and HasNetworkURL, 40,           // Downloading from URL (classic attack)
+        HasEncodeDecode and HasNetworkURL, 35,       // Encoding/decoding with network activity
+        HasURLCache, 30,                             // URL cache without visible URL (may be obfuscated)
+        HasEncodeDecode, 25,                         // Encoding/decoding files
+        HasMaliciousFlags, 20,                       // Other malicious flags
         10
     ),
     
-    // Encryption risk (RC4 is highly suspicious)
-    EncryptionRisk = case(
-        RC4Percentage >= 80, 30,      // Mostly RC4 (classic Kerberoasting)
-        RC4Percentage >= 50, 20,      // Half RC4
-        RC4RequestCount > 0, 10,      // Some RC4
-        0
+    // Context risk
+    ContextRisk = case(
+        IsFromSuspiciousPath and IsSuspiciousParent, 25,  // Suspicious path + parent
+        IsFromSuspiciousPath, 20,                         // Suspicious execution location
+        IsSuspiciousParent, 15,                           // Suspicious parent process
+        10
     ),
     
-    // Target value risk
-    TargetRisk = case(
-        HighValuePercentage >= 50, 15,  // Targeting high-value SPNs
-        HighValueSPNCount >= 5, 10,     // Multiple high-value targets
-        HighValueSPNCount > 0, 5,       // Some high-value targets
-        0
-    ),
-    
-    // Speed/pattern risk
-    BehaviorRisk = case(
-        ActivityDuration <= 300 and UniqueSPNs >= 15, 20,  // Very fast, high volume
-        ActivityDuration <= 600 and UniqueSPNs >= 10, 15,  // Fast enumeration
-        RequestRate > 10, 10,                               // High request rate
-        array_length(SourceIPs) > 1, 10,                   // Multiple source IPs
+    // Behavioral anomaly risk
+    AnomalyRisk = case(
+        IsNewUser, 20,                               // Never seen this user with certutil
+        IsNewPath and HasBaseline, 15,               // New execution path for known user
+        FrequencyAnomaly > 90, 10,                   // Very rare usage
+        DaysSinceLastSeen > 180, 10,                 // Not seen in 6+ months
         5
     ),
     
-    // Anomaly risk
-    AnomalyRisk = case(
-        IsNewRequester and UniqueSPNs >= 15, 15,  // New requester, high volume
-        VolumeAnomaly > 10, 15,                   // 10x baseline
-        VolumeAnomaly > 5, 10,                    // 5x baseline  
-        IsNewRequester, 5,                        // First time requester
-        0
+    // Additional indicators
+    IndicatorRisk = case(
+        IsOffHours, 10,                              // Off-hours execution
+        5
     ),
     
-    // Account type adjustments
-    AccountTypeModifier = case(
-        IsComputerAccount == false and IsServiceAccount == false, 10,  // User account (unusual)
-        IsComputerAccount, 5,   // Computer account (compromised machine)
-        0                       // Service account (could be legitimate or compromised)
-    ),
-    
-    TotalRiskScore = VolumeRisk + EncryptionRisk + TargetRisk + BehaviorRisk + AnomalyRisk + AccountTypeModifier
+    TotalRiskScore = OperationRisk + ContextRisk + AnomalyRisk + IndicatorRisk
 
 | extend
     AlertSeverity = case(
-        TotalRiskScore >= 85, "Critical",
-        TotalRiskScore >= 70, "High",
-        TotalRiskScore >= 50, "Medium",
+        TotalRiskScore >= 75, "High",
+        TotalRiskScore >= 60, "Medium",
         "Low"
     )
 
 // Filter to actionable alerts
-| where AlertSeverity in ("Critical", "High", "Medium")
+| where AlertSeverity in ("High", "Medium")
 
 | extend
     Evidence = pack(
-        "UniqueSPNs", UniqueSPNs,
-        "UniqueServiceAccounts", UniqueServiceAccounts,
-        "TotalRequests", TotalRequests,
-        "ActivityDuration", ActivityDuration,
-        "RequestRate", RequestRate,
-        "RC4Percentage", RC4Percentage,
-        "HighValueSPNCount", HighValueSPNCount,
-        "SPNsSample", array_slice(SPNsRequested, 0, 10),  // First 10 for readability
-        "ServiceAccountsSample", array_slice(ServiceAccountsTargeted, 0, 10),
-        "SourceIPs", SourceIPs,
-        "VolumeAnomaly", VolumeAnomaly,
-        "IsNewRequester", IsNewRequester
+        "CommandLine", CommandLine,
+        "ExecutionPath", ExecPath,
+        "ParentProcess", ParentProcess,
+        "ParentCommandLine", ParentCommandLine,
+        "ExtractedURL", ExtractedURL,
+        "MaliciousFlags", extract_all(@"-(\w+)", CommandLine),
+        "IsFromSuspiciousPath", IsFromSuspiciousPath,
+        "IsNewPath", IsNewPath,
+        "IsNewUser", IsNewUser,
+        "BaselineExecutions", coalesce(BaselineExecutions, 0),
+        "DaysSinceLastSeen", DaysSinceLastSeen
     ),
     
     ThreatContext = pack(
-        "AttackType", "Kerberoasting",
-        "AttackPhase", "Credential Access - Offline Password Cracking Preparation",
-        "KeyIndicators", strcat_array(
+        "AttackType", case(
+            HasURLCache and HasNetworkURL, "File Download via Certutil",
+            HasEncodeDecode, "File Encoding/Obfuscation",
+            "Certutil LOLBAS Abuse"
+        ),
+        "CommonUsage", case(
+            HasURLCache, "Download malicious payload or tools",
+            HasEncodeDecode, "Obfuscate malware or exfiltrate data",
+            "Reconnaissance or staging"
+        ),
+        "RiskFactors", strcat_array(
             dynamic([
-                iff(RC4Percentage >= 80, "High RC4 Usage", ""),
-                iff(HighValueSPNCount >= 5, "High-Value Targets", ""),
-                iff(ActivityDuration <= 600, "Rapid Enumeration", ""),
-                iff(IsNewRequester, "New Requester", ""),
-                iff(VolumeAnomaly > 5, "Volume Anomaly", "")
+                iff(HasNetworkURL, "Network Download", ""),
+                iff(IsFromSuspiciousPath, "Suspicious Path", ""),
+                iff(IsSuspiciousParent, "Suspicious Parent", ""),
+                iff(IsNewUser, "New User", ""),
+                iff(IsOffHours, "Off-Hours", "")
             ]) | where strlen(tostring($0)) > 0,
             ", "
-        ),
-        "RiskBreakdown", pack(
-            "VolumeRisk", VolumeRisk,
-            "EncryptionRisk", EncryptionRisk,
-            "TargetRisk", TargetRisk,
-            "BehaviorRisk", BehaviorRisk,
-            "AnomalyRisk", AnomalyRisk
         )
     ),
     
     Recommendations = case(
-        AlertSeverity == "Critical",
-        "IMMEDIATE P0: 1) Disable ClientAccount 2) Force password reset for ALL targeted service accounts (25+ char, complex) 3) Review authentication logs for credential reuse 4) Hunt for lateral movement 5) Check for AS-REP roasting and other Kerberos attacks 6) Consider implementing AES encryption for all SPNs",
         AlertSeverity == "High",
-        "URGENT: 1) Validate ClientAccount activity authorization 2) If unauthorized, disable account 3) Reset passwords for high-value service accounts 4) Review SPN configurations 5) Check for weak encryption types 6) Monitor for offline cracking attempts",
-        "INVESTIGATE: 1) Confirm legitimate security scanning or monitoring 2) Validate service account necessity 3) Review SPN request patterns 4) Consider implementing honeypot SPNs"
+        "IMMEDIATE: 1) Isolate device 2) If URL present, analyze downloaded file 3) Check parent process legitimacy 4) Hunt for persistence mechanisms 5) Review account for compromise indicators 6) Block extracted URL at network perimeter",
+        AlertSeverity == "Medium",
+        "INVESTIGATE: 1) Validate user authorization for this activity 2) If URL present, analyze destination 3) Check for encoded/decoded files 4) Review command justification 5) Consider blocking certutil via AppLocker/WDAC if not required",
+        "MONITOR: Document for baseline improvement"
     ),
     
-    DetectedTechniques = "T1558.003 (Steal or Forge Kerberos Tickets: Kerberoasting), T1558 (Steal or Forge Kerberos Tickets)"
-
-// Additional context for response
-| extend
-    RemediationSteps = pack(
-        "ImmediateActions", dynamic([
-            "Disable attacking account",
-            "Reset passwords for all targeted service accounts",
-            "Force minimum 25-character passwords with complexity"
-        ]),
-        "ForensicActions", dynamic([
-            "Review Kerberos ticket requests (Event IDs 4768, 4769, 4770, 4771)",
-            "Check for TGT requests (AS-REP roasting - Event ID 4768 with PreAuth = No)",
-            "Hunt for password spray attempts",
-            "Review failed authentication events for offline cracking validation"
-        ]),
-        "PreventionActions", dynamic([
-            "Implement AES encryption for all SPNs (disable RC4)",
-            "Deploy honeypot service accounts with alerts",
-            "Enforce strong service account passwords (25+ characters)",
-            "Reduce number of accounts with SPNs",
-            "Implement privileged access management (PAM) for service accounts",
-            "Enable Advanced Threat Analytics or Azure ATP"
-        ])
+    DetectedTechniques = strcat_array(
+        dynamic([
+            "T1105 (Ingress Tool Transfer)",
+            iff(HasEncodeDecode, "T1027 (Obfuscated Files or Information)", ""),
+            iff(HasURLCache, "T1218 (System Binary Proxy Execution)", ""),
+            "T1140 (Deobfuscate/Decode Files or Information)"
+        ]) | where strlen(tostring($0)) > 0,
+        ", "
+    ),
+    
+    IOCs = pack(
+        "URLs", iff(isnotempty(ExtractedURL), dynamic([ExtractedURL]), dynamic([])),
+        "SuspiciousPath", ExecPath,
+        "CommandPattern", CommandLine
     )
 
 | project
-    TimeGenerated = LastRequest,
+    TimeGenerated,
+    DeviceName,
     AlertSeverity,
     TotalRiskScore,
-    ClientAccount,
-    AccountType = case(
-        IsComputerAccount, "Computer Account",
-        IsServiceAccount, "Service Account",
-        "User Account"
-    ),
-    UniqueSPNs,
-    UniqueServiceAccounts,
-    TotalRequests,
-    ActivityDurationSeconds = ActivityDuration,
-    RC4Percentage,
-    HighValueSPNCount,
+    Account = strcat(Domain, "\\", Account),
+    CommandLine,
+    ExecutionPath = ExecPath,
+    ExtractedURL,
+    ParentProcess,
     ThreatContext,
     Evidence,
+    IOCs,
     DetectedTechniques,
-    Recommendations,
-    RemediationSteps
+    Recommendations
 
 | sort by TotalRiskScore desc, TimeGenerated desc
-
-references:
-  - https://attack.mitre.org/techniques/T1558/003/
-  - https://cloud.google.com/blog/topics/threat-intelligence/unc2165-shifts-to-evade-sanctions/
-  - https://www.cisa.gov/news-events/cybersecurity-advisories/aa24-190a
-  - https://www.microsoft.com/en-us/security/blog/2021/01/20/deep-dive-into-the-solorigate-second-stage-activation-from-sunburst-to-teardrop-and-raindrop/
-  - https://thedfirreport.com/2020/11/05/ryuk-speed-run-2-hours-to-ransom/
-
-triage: |
-  This alert means an attacker has successfully harvested credentials for offline password cracking, which can lead to rapid lateral movement.
-    1. Immediate Attacker Account Containment
-      •	Disable/Isolate Account: Immediately disable or force a high-complexity password reset for the ClientAccount (the attacking source account) to halt the enumeration attack.
-      •	Review Source: If available in the Evidence, check the source SourceIPs for malware or further malicious activity; this is the device where the attacker has a foothold.
-    2. Targeted Service Account Remediation (Highest Priority)
-      •	Identify Targets: Retrieve the full list of Service Accounts (ServiceAccountsTargeted) and prioritize the accounts matching the HighValueSPNCount.
-      •	Force Password Reset (CRITICAL): Immediately force a password reset for all targeted service accounts. Crucially, enforce a minimum length of 25 characters and complexity for these accounts to make offline cracking infeasible.
-      •	Review Encryption: Review the Kerberos properties for the targeted SPNs. If the RC4Percentage is high, work with Identity/Domain Admins to enforce AES encryption for the affected SPNs to prevent future Kerberoasting.
-    3. Domain and Network Scoping
-      •	Check for Lateral Movement: Search authentication logs for the targeted Service Accounts (those just reset) for any logon attempts occurring after the Kerberoasting alert. This checks if the attacker has already cracked and reused the passwords.
-      •	Hunt for Parallel Attacks: Check the Domain Controller logs for related Kerberos events from the ClientAccount, such as:
-        o	AS-REP Roasting: Check for Event ID 4768 (TGT Request) where Pre-Authentication is not used on non-user accounts.
-        o	Ticket Injection: Hunt for the attacker importing their own tickets (Event ID 4624 with suspicious Logon Type).
-    4. Escalation
-      •	Escalate: Confirm the incident as a breach involving T1558.003 (Kerberoasting) and coordinate with the Identity/Domain teams to ensure all targeted accounts are secured and long-term Kerberos protection is enforced.
-
-notes: |
-  - check
