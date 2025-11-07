@@ -1,3 +1,18 @@
+Field Name,Value
+rule_id,"(Placeholder - e.g., RUL-WND-18001)"
+short_description,"""Detects high-risk Certutil command line flags (e.g., -urlcache, -encode) executed from suspicious paths or by users with anomalous historical activity."""
+platform,Windows
+data_source,endpoint
+data_telemetry_stream,DeviceProcessEvents
+attack_tactic,"Execution, Defense-Evasion"
+attack_technique,"T1105 (Ingress Tool Transfer), T1218 (System Binary Proxy Execution)"
+method_category,"Signature, Behavioral"
+method_value,"Signature/LOLBIN-Flags, Behavioral/Baseline-Deviation"
+priority,P2-High
+core_indicators,"Certutil_Malicious_Flag, Execution_Path_Anomaly, Account_New_Activity"
+
+
+
 // Certutil LOLBAS Abuse Detection
 // Detects malicious use of certutil.exe for file downloads, encoding, and reconnaissance
 
