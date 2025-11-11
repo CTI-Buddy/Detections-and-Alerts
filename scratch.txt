@@ -550,3 +550,282 @@ AggregatedActivity
     ResponseActions
 
 | sort by TotalRiskScore desc, TimeGenerated desc
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+Field Name,Value
+rule_id,"(Placeholder - e.g., RUL-AZR-19001)"
+short_description,"""Detects the two-phase sequence of OAuth Device Code Phishing: attacker initiation followed by victim redemption to a high-value resource."""
+platform,Azure
+data_source,cloud_logs
+data_telemetry_stream,SigninLogs (Azure AD Sign-in)
+attack_tactic,"Initial Access, Persistence"
+attack_technique,"T1566.002 (Phishing: Spearphishing Link), T1528 (Steal Application Access Token)"
+method_category,"Behavioral, Protocol Abuse"
+method_value,"Behavioral/OAuth-Code-Correlation, Contextual/Location-Discrepancy"
+priority,P1-Critical
+core_indicators,"Code_Request_vs_Redemption, IP_Mismatch, Unknown_App"
+
+
+// OAuth Device Code Phishing Detection
+// Detects device code flow abuse where attacker tricks victim into authenticating
+
+// Parameters
+let DetectionWindow = 1h;
+let CorrelationWindow = 15m;  // Max time between request and redemption
+let BaselineWindow = 30d;
+
+// High-value resources commonly targeted
+let HighValueResources = dynamic([
+    "Office 365 Exchange Online",
+    "Microsoft Graph", 
+    "Office 365 SharePoint Online",
+    "Azure Active Directory Graph",
+    "Windows Azure Service Management API"
+]);
+
+// Legitimate applications that use device code flow (customize)
+let LegitimateDeviceCodeApps = dynamic([
+    "Azure CLI",
+    "Azure PowerShell",
+    "Microsoft Azure CLI",
+    "Azure Cloud Shell"
+]);
+
+// Get baseline of device code usage patterns
+let DeviceCodeBaseline = SigninLogs
+| where TimeGenerated between (ago(BaselineWindow) .. ago(DetectionWindow))
+| where AuthenticationProtocol == "deviceCode" or ClientAppUsed == "Mobile Apps and Desktop clients"
+| summarize 
+    BaselineUsageCount = count(),
+    KnownUsers = make_set(UserPrincipalName),
+    KnownIPs = make_set(IPAddress)
+by AppDisplayName;
+
+// Phase 1: Device Code Initiation Events
+let DeviceCodeInitiation = SigninLogs
+| where TimeGenerated >= ago(DetectionWindow)
+| where ResultType == 0  // Successful authentication
+// Device code flow indicators
+| where AuthenticationProtocol == "deviceCode"
+    or (ClientAppUsed in ("Mobile Apps and Desktop clients", "Other") 
+        and ResourceDisplayName == "Device Registration Service")
+    or AppDisplayName has "Device"
+| extend
+    InitiationTime = TimeGenerated,
+    InitiationUser = UserPrincipalName,
+    InitiationIP = IPAddress,
+    InitiationLocation = Location,
+    InitiationApp = AppDisplayName,
+    InitiationDevice = DeviceDetail.deviceId,
+    InitiationOS = DeviceDetail.operatingSystem,
+    // Extract authentication method details
+    AuthMethodsJson = parse_json(AuthenticationDetails)
+| extend
+    IsDeviceCodeAuth = AuthenticationProtocol == "deviceCode"
+        or tostring(AuthMethodsJson) has "deviceCode"
+        or tostring(AuthMethodsJson) has "Device Code"
+| where IsDeviceCodeAuth
+| project InitiationTime, InitiationUser, InitiationIP, InitiationLocation,
+          InitiationApp, InitiationDevice, InitiationOS, UserPrincipalName;
+
+// Phase 2: Token Grant/Resource Access Events (Redemption)
+let TokenGrant = SigninLogs
+| where TimeGenerated >= ago(DetectionWindow)
+| where ResultType == 0  // Successful sign-in
+| where ResourceDisplayName in (HighValueResources)
+// Look for characteristics of device code redemption
+| where ClientAppUsed in ("Mobile Apps and Desktop clients", "Other")
+    or AuthenticationProtocol == "deviceCode"
+| extend
+    RedemptionTime = TimeGenerated,
+    RedemptionUser = UserPrincipalName,
+    RedemptionIP = IPAddress,
+    RedemptionLocation = Location,
+    RedemptionResource = ResourceDisplayName,
+    RedemptionApp = AppDisplayName,
+    RedemptionDevice = DeviceDetail.deviceId,
+    RedemptionRiskLevel = RiskLevelDuringSignIn,
+    RedemptionRiskState = RiskState
+| project RedemptionTime, RedemptionUser, RedemptionIP, RedemptionLocation,
+          RedemptionResource, RedemptionApp, RedemptionDevice,
+          RedemptionRiskLevel, RedemptionRiskState, UserPrincipalName;
+
+// Correlation: Match initiation with redemption by user and time
+let CorrelatedEvents = DeviceCodeInitiation
+| join kind=inner (TokenGrant) on UserPrincipalName
+| extend TimeDeltaSeconds = datetime_diff('second', RedemptionTime, InitiationTime)
+| where TimeDeltaSeconds between (1 .. 900)  // 15 minutes max
+| extend
+    // Risk indicators
+    IsDifferentIP = InitiationIP != RedemptionIP,
+    IsDifferentLocation = InitiationLocation != RedemptionLocation,
+    IsDifferentDevice = InitiationDevice != RedemptionDevice,
+    HasRiskSignals = RedemptionRiskLevel in ("high", "medium") or RedemptionRiskState == "atRisk",
+    IsRapidRedemption = TimeDeltaSeconds <= 60,  // Redeemed within 1 minute (suspicious)
+    IsKnownApp = InitiationApp in (LegitimateDeviceCodeApps);
+
+// Join with baseline for anomaly detection
+CorrelatedEvents
+| join kind=leftouter (DeviceCodeBaseline) on $left.InitiationApp == $right.AppDisplayName
+| extend
+    IsNewApp = isnull(BaselineUsageCount) or BaselineUsageCount < 3,
+    IsNewUser = not(KnownUsers has UserPrincipalName),
+    IsAnomalousActivity = IsNewApp or IsNewUser;
+
+// Enhanced Risk Scoring
+CorrelatedEvents
+| extend
+    // Base risk (device code flow itself is unusual)
+    BaseRisk = case(
+        IsNewApp and not(IsKnownApp), 40,          // Unknown app using device code
+        not(IsKnownApp), 30,                       // Non-standard app
+        IsAnomalousActivity, 25,                   // New usage pattern
+        20
+    ),
+    
+    // Context risk (signs of phishing)
+    ContextRisk = case(
+        IsDifferentIP and IsDifferentLocation, 30,  // Different geo + IP (classic phishing)
+        IsDifferentIP, 20,                          // Different IP
+        IsDifferentLocation, 15,                    // Different location
+        IsDifferentDevice, 10,                      // Different device
+        5
+    ),
+    
+    // Behavior risk
+    BehaviorRisk = case(
+        IsRapidRedemption and IsDifferentIP, 20,    // Very fast + different IP (automated)
+        IsRapidRedemption, 15,                      // Very fast redemption
+        TimeDeltaSeconds <= 120, 10,                // Redeemed within 2 minutes
+        5
+    ),
+    
+    // Identity risk
+    IdentityRisk = case(
+        HasRiskSignals, 15,                         // Azure AD Identity Protection flagged
+        RedemptionRiskLevel == "high", 10,
+        0
+    ),
+    
+    TotalRiskScore = BaseRisk + ContextRisk + BehaviorRisk + IdentityRisk
+
+| extend
+    AlertSeverity = case(
+        TotalRiskScore >= 75, "Critical",
+        TotalRiskScore >= 60, "High",
+        TotalRiskScore >= 45, "Medium",
+        "Low"
+    )
+
+// Filter to actionable alerts
+| where AlertSeverity in ("Critical", "High", "Medium")
+
+| extend
+    Evidence = pack(
+        "InitiationTime", InitiationTime,
+        "RedemptionTime", RedemptionTime,
+        "TimeDeltaSeconds", TimeDeltaSeconds,
+        "VictimUser", UserPrincipalName,
+        "InitiationIP", InitiationIP,
+        "RedemptionIP", RedemptionIP,
+        "InitiationLocation", InitiationLocation,
+        "RedemptionLocation", RedemptionLocation,
+        "InitiationApp", InitiationApp,
+        "TargetResource", RedemptionResource,
+        "IsDifferentIP", IsDifferentIP,
+        "IsDifferentLocation", IsDifferentLocation,
+        "HasRiskSignals", HasRiskSignals,
+        "IsRapidRedemption", IsRapidRedemption,
+        "IsNewApp", IsNewApp
+    ),
+    
+    ThreatContext = pack(
+        "AttackType", "OAuth Device Code Phishing",
+        "AttackFlow", "Attacker initiates device code → Victim enters code → Attacker gains access",
+        "KeyIndicators", strcat_array(
+            dynamic([
+                iff(IsDifferentIP and IsDifferentLocation, "Different Geography", ""),
+                iff(IsRapidRedemption, "Rapid Redemption", ""),
+                iff(HasRiskSignals, "Identity Risk Signals", ""),
+                iff(IsNewApp, "Unknown Application", ""),
+                iff(not(IsKnownApp), "Non-Standard App", "")
+            ]) | where strlen(tostring($0)) > 0,
+            ", "
+        ),
+        "Sophistication", case(
+            IsRapidRedemption and IsDifferentLocation, "High (Automated/Organized)",
+            IsDifferentIP, "Medium (Manual Phishing)",
+            "Low (Opportunistic)"
+        )
+    ),
+    
+    Recommendations = case(
+        AlertSeverity == "Critical",
+        "IMMEDIATE P0: 1) Revoke ALL refresh tokens for victim user 2) Force password reset 3) Review all sign-ins in last 24h for data access 4) Disable suspicious application if not legitimate 5) Check for mailbox rules, forwarding, OAuth app permissions 6) Hunt for lateral movement 7) Report phishing infrastructure to Microsoft",
+        AlertSeverity == "High",
+        "URGENT: 1) Contact user to confirm legitimacy 2) If phishing, revoke tokens and reset password 3) Review recent OAuth consents 4) Check for suspicious mailbox activity 5) Review application permissions 6) Consider blocking device code flow if not required",
+        "INVESTIGATE: 1) Validate with user 2) Review application legitimacy 3) Check for signs of compromise 4) Document for baseline if legitimate"
+    ),
+    
+    DetectedTechniques = "T1566.002 (Phishing: Spearphishing Link), T1078.004 (Valid Accounts: Cloud Accounts), T1528 (Steal Application Access Token)"
+
+// Response actions
+| extend
+    ResponseActions = pack(
+        "ImmediateActions", dynamic([
+            "Revoke user refresh tokens",
+            "Force MFA re-authentication",
+            "Review OAuth app consents",
+            "Check mailbox rules and forwarding"
+        ]),
+        "ForensicActions", dynamic([
+            "Review all sign-ins for victim user (last 7 days)",
+            "Check for data exfiltration (email forwarding, file downloads)",
+            "Hunt for additional victims with same initiation IP",
+            "Review application permissions granted",
+            "Check for persistence mechanisms (OAuth apps, mailbox rules)"
+        ]),
+        "PreventionActions", dynamic([
+            "Consider disabling device code flow if not required (Azure AD Conditional Access)",
+            "Implement risk-based Conditional Access policies",
+            "Enable Continuous Access Evaluation (CAE)",
+            "Educate users on device code phishing tactics",
+            "Implement application consent policies",
+            "Enable Azure AD Identity Protection"
+        ])
+    ),
+    
+    PhishingIndicators = pack(
+        "InitiationIP", InitiationIP,
+        "InitiationLocation", InitiationLocation,
+        "SuspiciousApp", InitiationApp,
+        "AttackTimeline", strcat(
+            "Code requested at ", InitiationTime, 
+            " from ", InitiationIP,
+            " → Redeemed ", TimeDeltaSeconds, 
+            "s later from ", RedemptionIP
+        )
+    )
+
+| project
+    TimeGenerated = RedemptionTime,
+    AlertSeverity,
+    TotalRiskScore,
+    VictimUser = UserPrincipalName,
+    InitiationIP,
+    RedemptionIP,
+    InitiationLocation,
+    RedemptionLocation,
+    TargetResource = RedemptionResource,
+    TimeDeltaSeconds,
+    ThreatContext,
+    Evidence,
+    PhishingIndicators,
+    DetectedTechniques,
+    Recommendations,
+    ResponseActions
+
+| sort by TotalRiskScore desc, TimeGenerated desc
