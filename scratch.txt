@@ -246,3 +246,307 @@ CertutilActivity
     Recommendations
 
 | sort by TotalRiskScore desc, TimeGenerated desc
+
+
+
+
+
+//////////////////////////////////////////////////////////
+Field Name,Value
+rule_id,"(Placeholder - e.g., RUL-AZR-18001)"
+short_description,"""Detects bulk secret retrieval, access to high-value secrets, or enumeration (SecretList) by a new or anomalous Azure identity."""
+platform,Azure
+data_source,cloud_logs
+data_telemetry_stream,AzureDiagnostics (Key Vault Audit Event)
+attack_tactic,"Credential-Access, Discovery"
+attack_technique,"T1555.006 (Credentials from Azure Key Vault), T1087.004 (Cloud Account Discovery)"
+method_category,"Behavioral, Statistical"
+method_value,"Behavioral/Secret-Access-Anomaly, Statistical/Burst-Detection"
+priority,P1-Critical
+core_indicators,"HV_Secret_Access, New_Identity_Access, Secret_Enumeration"
+
+
+// Azure Key Vault Secret Access Anomaly Detection
+// Detects suspicious secret access patterns: burst activity, enumeration, anomalous sources
+
+// Parameters
+let DetectionWindow = 1h;
+let BaselineWindow = 30d;
+let BurstThreshold = 5;          // Minimum accesses to consider burst
+let UniqueSecretsThreshold = 3;  // Minimum unique secrets for enumeration
+
+// High-value secrets (customize for your environment)
+let HighValueSecrets = dynamic([
+    "Prod-Admin-Key", "DB-Connection-String", "Global-Cert-Password",
+    "Critical-SPN-Secret", "ServicePrincipal-ClientSecret", "SQL-SA-Password"
+]);
+
+// Known legitimate automation/services (customize)
+let LegitimateCallers = dynamic([
+    "Azure DevOps Pipeline", "GitHub Actions", "Azure Automation",
+    "Logic App", "Function App"
+]);
+
+// Build baseline of normal Key Vault access patterns
+let KVBaseline = AzureDiagnostics
+| where TimeGenerated between (ago(BaselineWindow) .. ago(DetectionWindow))
+| where ResourceProvider == "MICROSOFT.KEYVAULT"
+| where Category == "AuditEvent"
+| where OperationName in ("SecretGet", "SecretList")
+| where ResultSignature == "OK"  // Only successful accesses
+| extend
+    // Extract secret name from requestUri_s
+    SecretName = extract(@"/secrets/([^/]+)", 1, requestUri_s),
+    CallerIdentity = coalesce(identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s,
+                               identity_claim_appid_s,
+                               CallerIPAddress)
+| where isnotempty(SecretName)
+| summarize
+    BaselineAccessCount = count(),
+    BaselineSecretsAccessed = make_set(SecretName),
+    BaselineIPs = make_set(CallerIPAddress),
+    BaselineOperations = make_set(OperationName),
+    LastSeenBefore = max(TimeGenerated),
+    AvgAccessesPerHour = count() / (BaselineWindow / 1h)
+by CallerIdentity;
+
+// Main detection: Recent Key Vault secret access
+let RecentKVActivity = AzureDiagnostics
+| where TimeGenerated >= ago(DetectionWindow)
+| where ResourceProvider == "MICROSOFT.KEYVAULT"
+| where Category == "AuditEvent"
+| where OperationName in ("SecretGet", "SecretList")
+| extend
+    // Extract key fields
+    SecretName = extract(@"/secrets/([^/]+)", 1, requestUri_s),
+    VaultName = Resource,
+    CallerIdentity = coalesce(
+        identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s,  // User UPN
+        identity_claim_appid_s,                                                      // App/Service Principal
+        CallerIPAddress                                                              // Fallback to IP
+    ),
+    CallerIP = CallerIPAddress,
+    IsSuccess = ResultSignature == "OK",
+    IsFailure = ResultSignature != "OK",
+    CallerType = case(
+        isnotempty(identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s), "User",
+        isnotempty(identity_claim_appid_s), "ServicePrincipal",
+        "Unknown"
+    ),
+    IsListOperation = OperationName == "SecretList"
+| where isnotempty(SecretName) or IsListOperation  // Include list operations even without specific secret
+| extend
+    // High-value secret detection
+    IsHighValueSecret = SecretName in (HighValueSecrets),
+    
+    // IP analysis (basic, without geo lookup dependency)
+    IsPrivateIP = ipv4_is_private(CallerIP),
+    IsAzureIP = CallerIP startswith "20." or CallerIP startswith "40." or CallerIP startswith "52."  // Common Azure ranges
+| project TimeGenerated, VaultName, CallerIdentity, CallerType, CallerIP,
+          SecretName, OperationName, IsSuccess, IsFailure, IsListOperation,
+          IsHighValueSecret, IsPrivateIP, IsAzureIP, ResultSignature;
+
+// Aggregate recent activity by caller
+let AggregatedActivity = RecentKVActivity
+| summarize
+    TotalAccesses = count(),
+    SuccessfulAccesses = countif(IsSuccess),
+    FailedAccesses = countif(IsFailure),
+    UniqueSecretsAccessed = dcountif(SecretName, isnotempty(SecretName)),
+    HighValueSecretsAccessed = dcountif(SecretName, IsHighValueSecret),
+    SecretsAccessed = make_set_if(SecretName, isnotempty(SecretName), 50),
+    UniqueIPs = dcount(CallerIP),
+    SourceIPs = make_set(CallerIP),
+    VaultsAccessed = dcount(VaultName),
+    VaultNames = make_set(VaultName),
+    Operations = make_set(OperationName),
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated),
+    HasListOperation = max(toint(IsListOperation)),
+    CallerType = any(CallerType)
+by CallerIdentity
+| where TotalAccesses >= BurstThreshold or UniqueSecretsAccessed >= UniqueSecretsThreshold
+| extend
+    ActivityDuration = datetime_diff('minute', LastAccess, FirstAccess),
+    AccessRate = todouble(TotalAccesses) / (datetime_diff('minute', LastAccess, FirstAccess) + 1);
+
+// Join with baseline for anomaly detection
+AggregatedActivity
+| join kind=leftouter (KVBaseline) on CallerIdentity
+| extend
+    HasBaseline = isnotnull(BaselineAccessCount),
+    IsNewCaller = isnull(BaselineAccessCount) or BaselineAccessCount < 3,
+    
+    // Calculate new secrets accessed (not in baseline)
+    NewSecretsCount = iif(HasBaseline,
+        array_length(set_difference(SecretsAccessed, BaselineSecretsAccessed)),
+        UniqueSecretsAccessed),
+    
+    // IP anomaly
+    IsNewIP = iif(HasBaseline,
+        not(set_has_element(BaselineIPs, tostring(SourceIPs[0]))),
+        true),
+    
+    // Volume anomaly
+    VolumeAnomaly = iif(HasBaseline and AvgAccessesPerHour > 0,
+        todouble(TotalAccesses) / AvgAccessesPerHour,
+        100.0),
+    
+    // Calculate days since last seen
+    DaysSinceLastSeen = iif(HasBaseline,
+        datetime_diff('day', FirstAccess, LastSeenBefore),
+        9999);
+
+// Enhanced Risk Scoring
+AggregatedActivity
+| extend
+    // Base activity risk
+    ActivityRisk = case(
+        HighValueSecretsAccessed >= 3, 40,              // Multiple high-value secrets
+        HighValueSecretsAccessed >= 1, 30,              // At least one high-value secret
+        UniqueSecretsAccessed >= 10, 25,                // Mass enumeration
+        UniqueSecretsAccessed >= 5, 20,                 // Moderate enumeration
+        15
+    ),
+    
+    // Caller anomaly risk
+    CallerRisk = case(
+        IsNewCaller and HighValueSecretsAccessed > 0, 30,  // New caller + high-value
+        IsNewCaller, 25,                                   // Brand new caller
+        DaysSinceLastSeen > 180, 20,                       // Not seen in 6+ months
+        NewSecretsCount >= 5, 15,                          // Accessing many new secrets
+        NewSecretsCount >= 1, 10,                          // Accessing some new secrets
+        5
+    ),
+    
+    // Behavior pattern risk
+    BehaviorRisk = case(
+        AccessRate > 10 and ActivityDuration <= 5, 25,     // Very rapid burst
+        FailedAccesses >= 5, 20,                           // Multiple failures (permission probing)
+        HasListOperation == 1, 15,                         // List operation (enumeration)
+        VaultsAccessed > 1, 10,                            // Multiple vaults
+        UniqueIPs > 1, 10,                                 // Multiple source IPs
+        5
+    ),
+    
+    // Context risk
+    ContextRisk = case(
+        IsNewIP and not(IsAzureIP) and not(IsPrivateIP), 15,  // New external IP
+        CallerType == "Unknown", 10,                           // Unknown caller type
+        5
+    ),
+    
+    TotalRiskScore = ActivityRisk + CallerRisk + BehaviorRisk + ContextRisk
+
+| extend
+    AlertSeverity = case(
+        TotalRiskScore >= 85, "Critical",
+        TotalRiskScore >= 70, "High",
+        TotalRiskScore >= 50, "Medium",
+        "Low"
+    )
+
+// Filter to actionable alerts
+| where AlertSeverity in ("Critical", "High", "Medium")
+
+| extend
+    Evidence = pack(
+        "TotalAccesses", TotalAccesses,
+        "SuccessfulAccesses", SuccessfulAccesses,
+        "FailedAccesses", FailedAccesses,
+        "UniqueSecretsAccessed", UniqueSecretsAccessed,
+        "HighValueSecretsAccessed", HighValueSecretsAccessed,
+        "SecretsSample", array_slice(SecretsAccessed, 0, 10),
+        "NewSecretsCount", NewSecretsCount,
+        "ActivityDuration", ActivityDuration,
+        "AccessRate", AccessRate,
+        "SourceIPs", SourceIPs,
+        "VaultsAccessed", VaultsAccessed,
+        "IsNewCaller", IsNewCaller,
+        "IsNewIP", IsNewIP,
+        "HasListOperation", HasListOperation == 1,
+        "VolumeAnomaly", VolumeAnomaly
+    ),
+    
+    ThreatContext = pack(
+        "AttackType", case(
+            HasListOperation == 1 and UniqueSecretsAccessed >= 5, "Secret Enumeration + Bulk Extraction",
+            HasListOperation == 1, "Secret Enumeration",
+            HighValueSecretsAccessed >= 2, "High-Value Secret Targeting",
+            UniqueSecretsAccessed >= 10, "Bulk Secret Extraction",
+            "Anomalous Secret Access"
+        ),
+        "KeyIndicators", strcat_array(
+            dynamic([
+                iff(IsNewCaller, "New Caller", ""),
+                iff(HighValueSecretsAccessed > 0, "High-Value Secrets", ""),
+                iff(HasListOperation == 1, "List Operation", ""),
+                iff(VolumeAnomaly > 5, "Volume Spike", ""),
+                iff(FailedAccesses >= 5, "Permission Probing", ""),
+                iff(NewSecretsCount >= 5, "New Secret Access", "")
+            ]) | where strlen(tostring($0)) > 0,
+            ", "
+        ),
+        "RiskBreakdown", pack(
+            "ActivityRisk", ActivityRisk,
+            "CallerRisk", CallerRisk,
+            "BehaviorRisk", BehaviorRisk,
+            "ContextRisk", ContextRisk
+        )
+    ),
+    
+    Recommendations = case(
+        AlertSeverity == "Critical",
+        "IMMEDIATE P0: 1) Disable caller identity immediately 2) Rotate ALL accessed secrets (especially high-value) 3) Review Key Vault access policies 4) Check for data exfiltration 5) Hunt for compromised credentials 6) Enable Key Vault firewall if not already 7) Review audit logs for unauthorized changes",
+        AlertSeverity == "High",
+        "URGENT: 1) Validate caller authorization 2) If unauthorized, disable identity and rotate accessed secrets 3) Review access justification 4) Check for anomalous authentication to this identity 5) Verify IP source legitimacy 6) Consider implementing private endpoints",
+        "INVESTIGATE: 1) Confirm business justification for access pattern 2) Validate secrets accessed align with caller's purpose 3) Review if baseline needs updating 4) Consider implementing access policies/network restrictions"
+    ),
+    
+    DetectedTechniques = "T1555 (Credentials from Password Stores), T1552 (Unsecured Credentials), T1078.004 (Valid Accounts: Cloud Accounts), T1087.004 (Account Discovery: Cloud Account)"
+
+// Response actions
+| extend
+    ResponseActions = pack(
+        "ImmediateActions", dynamic([
+            "Disable compromised identity",
+            "Rotate accessed secrets immediately",
+            "Review Key Vault access policies",
+            "Check for secret exfiltration"
+        ]),
+        "ForensicActions", dynamic([
+            "Review all Key Vault audit logs for this caller",
+            "Check authentication logs for identity compromise",
+            "Hunt for lateral movement using accessed secrets",
+            "Review other Azure resources accessed by this identity"
+        ]),
+        "PreventionActions", dynamic([
+            "Implement Key Vault firewall rules",
+            "Enable private endpoints for Key Vaults",
+            "Implement access policies with least privilege",
+            "Enable soft-delete and purge protection",
+            "Implement managed identities instead of service principals where possible",
+            "Enable Advanced Threat Protection for Key Vault"
+        ])
+    )
+
+| project
+    TimeGenerated = LastAccess,
+    AlertSeverity,
+    TotalRiskScore,
+    CallerIdentity,
+    CallerType,
+    TotalAccesses,
+    UniqueSecretsAccessed,
+    HighValueSecretsAccessed,
+    FailedAccesses,
+    ActivityDurationMinutes = ActivityDuration,
+    SourceIPs,
+    VaultNames,
+    ThreatContext,
+    Evidence,
+    DetectedTechniques,
+    Recommendations,
+    ResponseActions
+
+| sort by TotalRiskScore desc, TimeGenerated desc
