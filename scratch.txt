@@ -1,4 +1,4 @@
-Field Name,Value
+ Field Name,Value
 rule_id,"(Placeholder - e.g., RUL-WND-18001)"
 short_description,"""Detects high-risk Certutil command line flags (e.g., -urlcache, -encode) executed from suspicious paths or by users with anomalous historical activity."""
 platform,Windows
